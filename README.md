@@ -1,4 +1,4 @@
-# claude-code-skills
+# my-daily-tools
 
 Portable [Claude Code](https://claude.com/claude-code) skills for personal daily automation. Each skill is a self-contained directory (`tools/<name>/`) with a `SKILL.md` — install by symlinking into `~/.claude/skills/` and they become available in every Claude Code session via `/skill-name`.
 
@@ -20,7 +20,7 @@ These are the tools I run for my own daily workflow. They are published as-is be
 
 ```bash
 git clone https://github.com/harleyru/my-daily-tools.git
-ln -s "$PWD/claude-code-skills/tools/"* ~/.claude/skills/   # new sessions pick them up
+ln -s "$PWD/my-daily-tools/tools/"* ~/.claude/skills/   # new sessions pick them up
 ```
 
 Each skill's `SKILL.md` documents its own configuration. The general model:
@@ -60,6 +60,10 @@ config-examples/         — config templates (copy to data/, which is gitignore
 - `mail_ntu_move.py` is a reference implementation for routing forwarded mail from an institutional mailbox into a folder; adjust the domain/label to your own setup.
 - `radar`'s editorial stage and `discord-bridge`'s answer tiers shell out to an LLM CLI headlessly — point `RADAR_EDITOR` (radar) or `CLAUDE_CLI` (discord-bridge) at any Anthropic-compatible CLI; both fall back to `claude`.
 - The `discord-bridge` auto-execution tier only grants read-only web tools to the LLM agent; mutating host actions are queued to the human session by contract (`need_session`).
+
+## Related
+
+- [lab-instrument-drivers](https://github.com/harleyru/lab-instrument-drivers) — typed, auditable Python drivers and agent skills for safe laboratory-instrument discovery and automation via PyVISA (the hardware-facing counterpart to these skills).
 
 ## License
 
