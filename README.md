@@ -64,7 +64,3 @@ config-examples/         — config templates (copy to data/, which is gitignore
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-## Related
-
-- [lab-instrument-drivers](https://github.com/harleyru/lab-instrument-drivers) — typed, auditable PyVISA instrument drivers + agent skills for safe autonomous instrument control.

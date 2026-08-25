@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""研究雷达预筛: 关键词召回 + sqlite seen 去重 → data/radar/raw/YYYY-MM-DD/prefiltered.json
+"""Research radar prefilter: keyword recall + sqlite seen dedupe
+→ data/radar/raw/YYYY-MM-DD/prefiltered.json
 
-关键词按 track 分组, 只做召回(编辑台做语义决策, 预筛宁多勿少)。
-seen 表防止 96h 回看窗口内的重复条目被重复评分。
-用法: python3 radar_prefilter.py [YYYY-MM-DD]
+Keywords are grouped by track; recall-only (the editorial stage makes the semantic
+decision — better to over-recall). The seen table prevents re-scoring duplicates
+within the 96h lookback window.
+Usage: python3 radar_prefilter.py [YYYY-MM-DD]
 """
 import json
 import os
@@ -25,7 +27,7 @@ def init_db():
 
 
 def match_tracks(title, text):
-    """返回 {track: [命中关键词...]}。大小写不敏感子串匹配。"""
+    """Returns {track: [matched keywords...]}. Case-insensitive substring match."""
     hay = (title + " " + text).lower()
     hits = {}
     for track, kws in CONFIG["keywords"].items():
@@ -39,7 +41,7 @@ def main():
     date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
     items_path = os.path.join(RAW, date, "items.json")
     if not os.path.exists(items_path):
-        print(f"❌ 找不到 {items_path}, 先跑 radar_fetch.py")
+        print(f"❌ missing {items_path}, run radar_fetch.py first")
         sys.exit(1)
     data = json.load(open(items_path, encoding="utf-8"))
     fetched = len(data["items"])
@@ -59,7 +61,8 @@ def main():
         seen.add(uid)
         out = dict(it)
         out["trackHints"] = {t: len(k) for t, k in hits.items()}
-        # 排序代理分: 关键词命中密度 + 跨 track 交叉加分(多维度候选优先送给编辑台)
+        # rank proxy: keyword hit density + cross-track bonus (multi-dimensional
+        # candidates go to the editorial stage first)
         out["rank"] = sum(out["trackHints"].values()) + 5 * max(0, len(out["trackHints"]) - 1)
         kept.append(out)
     kept.sort(key=lambda x: -x["rank"])
@@ -68,7 +71,7 @@ def main():
     con.commit()
     con.close()
 
-    print(f"抓取 {fetched} 条 → 关键词命中 {len(kept)} 条(去重后)")
+    print(f"fetched {fetched} → {len(kept)} keyword hits (after dedupe)")
     out = {"date": date, "fetched": fetched, "prefiltered": len(kept),
            "generatedAt": now, "items": kept}
     with open(os.path.join(RAW, date, "prefiltered.json"), "w", encoding="utf-8") as f:

@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""Discord 收件桥(方案1: 待办池模式): 轮询频道里 @机器人 的消息 → 写入任务池 → 回执。
+"""Discord task bridge (pool mode): poll channel messages mentioning the bot → write to a
+task pool → reply. Pure stdlib (urllib, no pip deps), run every 60s from cron/systemd/launchd.
 
-纯 stdlib(urllib, 无 pip 依赖), 由 launchd 每 60s 跑一次 --poll。
-任务池 data/discord/tasks.json; 用户在 Claude 会话里说"处理 Discord 待办"时,我读池执行,完成后 --done 回帖。
+Task pool: data/discord/tasks.json. When a user says "handle the Discord todo list" in a
+Claude session, the pool is executed there, then tasks are marked done with --done.
 
-用法:
-    discord_tasks.py --discover            # 列出服务器/频道, 帮选定频道
-    discord_tasks.py --use-channel <id>    # 把频道写入配置
-    discord_tasks.py --add-role <id>       # 追加触发角色(用户常 @角色名而不是 @机器人)
-    discord_tasks.py --poll                # 轮询新 @消息(含 @触发角色), 入池 + 回执; "任务清单"类查询即时回帖
-                                           # 规则查询: 「雷达」→最新卡片摘要, 「邮件待审/广告待审/待审」→广告待删清单
-    discord_tasks.py --list                # 打印待办池
-    discord_tasks.py --done 3 [--result "完成内容"]   # 标记完成, 可回帖结果
-    discord_tasks.py --cleanup [--keep N]  # 归档历史已完成任务, 保留最近 N 条(默认 10)
-    discord_tasks.py --post "文本"         # 直接发消息到频道
-    discord_tasks.py --file <path> [--text "说明"]   # 上传本地文件到频道
-    discord_tasks.py --answer "文本"      # 本地测试自动问答档(不发 Discord, 打印结果)
-    discord_tasks.py --task "文本"        # 本地测试自动调研档(只读联网, 不发 Discord, 打印结果)
+Trigger words below (EVENT_VERBS / QUERY_WORDS / QUERY_VERBS / RULE_WORDS /
+AUTO_QUESTION / FORCE_POOL) are constants — match them to your own language and usage.
 
-token 存 Keychain (service: discord_bot_token); 频道 id / 触发角色在 data/discord/config.json
+Usage:
+    discord_tasks.py --discover            # list servers/channels, pick one
+    discord_tasks.py --use-channel <id>    # write the channel to config
+    discord_tasks.py --add-role <id>       # add a trigger role (users often @ a role instead of the bot)
+    discord_tasks.py --poll                # poll new @ messages (incl. trigger roles): pool + reply; list-type queries answer inline
+                                           # rule queries: "radar" → latest radar summary, "mail pending" → ad-review list
+    discord_tasks.py --list                # print the task pool
+    discord_tasks.py --done 3 [--result "done content"]   # mark done, optionally reply with a result
+    discord_tasks.py --cleanup [--keep N]  # archive finished tasks, keep the last N (default 10)
+    discord_tasks.py --post "text"         # post a message to the channel
+    discord_tasks.py --file <path> [--text "caption"]     # upload a local file to the channel
+    discord_tasks.py --answer "text"       # test the auto-answer mode locally (no Discord, prints result)
+    discord_tasks.py --task "text"         # test the auto-research mode locally (read-only web, no Discord)
+
+Token in Keychain (service: discord_bot_token); channel id / trigger roles in data/discord/config.json
 """
 import datetime
 import fcntl
@@ -41,40 +45,48 @@ TASKS = os.path.join(CFG_DIR, "tasks.json")
 STATE = os.path.join(CFG_DIR, "state.json")
 ARCHIVE = os.path.join(CFG_DIR, "archive.json")
 EVENT_QUEUE = os.path.join(CFG_DIR, "pending_events.json")
-EVENT_VERBS = ("加日程", "添加日程", "新增日程", "安排日程", "记日程")
 LOCK = os.path.join(CFG_DIR, "poll.lock")
 API = "https://discord.com/api/v10"
-# 消息正文含这些词的 → 不回执不入池, 直接在频道回帖当前任务清单
-QUERY_WORDS = ("任务清单", "待办清单", "待办列表", "任务列表", "任务有哪些", "有哪些任务", "待办")
-# 「任务/task + 查询式动词」也判为清单查询, 覆盖「查询task」「发一下目前的任务」「今天任务还剩下几个」这类说法
-QUERY_VERBS = ("查询", "查一下", "发一下", "看一下", "看看", "看下", "列出", "显示",
-               "list", "目前", "现在", "有哪些", "剩下")
+
+# --- trigger words (match to your own language) ---
+EVENT_VERBS = ("add event", "schedule", "new event", "book")          # schedule-request verbs
+FORCE_POOL = "force-pool"                                             # mention to force manual pool mode
+# list-type queries: no pool entry, reply with the current task list instead
+QUERY_WORDS = ("task list", "todo list", "todos", "list of tasks", "current tasks", "what tasks")
+# "task/todo + query verb" also counts as a list query ("query tasks", "show me the tasks", ...)
+QUERY_VERBS = ("query", "check", "show", "see", "look", "list", "display",
+               "current", "now", "remaining", "left", "pending", "have")
+# rule queries: trigger word + the remainder (after stripping it) empty or question-like → answer from local data
+RULE_WORDS = {
+    "radar": ("radar",),
+    "mail": ("mail pending", "ad review", "ad pending", "pending mail"),
+    "schedule": ("schedule", "calendar", "agenda"),
+}
+QUERY_MARKERS = ("pushed", "report", "what", "today", "tomorrow", "latest", "now",
+                 "anything", "?")
+# auto-answer trigger: question-like messages only; hands-on tasks go to the pool as usual
+AUTO_QUESTION = ("?", "what", "why", "how", "explain", "summarize", "analyze", "translate",
+                 "compare", "who", "when", "where", "which", "what is", "how to")
+# section headings of your ongoing.md ("in-progress" / "todo" tables) — match to your own file
+ONGOING_HEADERS = {
+    "in-progress": "## 🚧 In progress",
+    "todo": "## 🗓 Todo",
+}
+CALENDAR_NAME = "Agent"  # macOS calendar used for scheduled events
 
 
 def _is_task_query(content):
-    """清单查询判定; 含「入池」强制走任务池(与自动问答档同样的逃生舱)"""
-    if "入池" in content:
+    """List-query check; "force-pool" forces pool mode (same escape hatch as the auto modes)"""
+    if FORCE_POOL in content:
         return False
-    if any(w in content for w in QUERY_WORDS):
+    low = content.lower()
+    if any(w in low for w in QUERY_WORDS):
         return True
-    c = content.lower()
-    return ("任务" in content or "task" in c) and any(v in c for v in QUERY_VERBS)
-# 规则查询: 命中触发词 且 剥掉触发词后剩余为空/含疑问词 → 直接回帖本地数据, 不入池
-RULE_WORDS = {
-    "radar": ("雷达", "radar"),
-    "mail": ("邮件待审", "广告待审", "待审"),
-    "schedule": ("日程", "安排", "calendar"),
-}
-QUERY_MARKERS = ("推了", "推送", "报告", "什么", "啥", "今天", "明天", "明日", "最新", "现在",
-                 "吗", "呢", "有哪些", "有啥", "怎么样", "如何", "report")
-# 自动问答触发特征: 疑问式才自动答, 其余(动手任务)照旧入池
-AUTO_QUESTION = ("?", "？", "吗", "呢", "是什么", "为什么", "怎么", "怎样", "如何",
-                 "解释", "总结", "分析", "翻译", "介绍一下", "对比",
-                 "什么", "多少", "哪些", "请问")
+    return ("task" in low or "todo" in low) and any(v in low for v in QUERY_VERBS)
 
 
 def token():
-    # .env 优先(服务器), 回退 Keychain(Mac 本地)
+    # .env first (server), fall back to Keychain (macOS)
     t = ""
     try:
         for line in open(os.path.join(BASE, ".env"), encoding="utf-8"):
@@ -88,14 +100,14 @@ def token():
                              capture_output=True, text=True)
         t = out.stdout.strip()
     if not t:
-        sys.exit("❌ 没有 discord_bot_token(需要 ~/daily/.env 或 Keychain)")
+        sys.exit("❌ no discord_bot_token (need ~/daily/.env or Keychain)")
     return t
 
 
 def api(method, path, data=None, timeout=30):
     req = urllib.request.Request(API + path, method=method)
     req.add_header("Authorization", "Bot " + token())
-    req.add_header("User-Agent", "ru-discord-bridge")
+    req.add_header("User-Agent", "my-daily-tools-discord-bridge")
     body = None
     if data is not None:
         body = json.dumps(data).encode()
@@ -110,7 +122,7 @@ def api(method, path, data=None, timeout=30):
 def bot_id():
     st, me = api("GET", "/users/@me")
     if st != 200:
-        sys.exit(f"❌ bot token 无效(HTTP {st})")
+        sys.exit(f"❌ bot token invalid (HTTP {st})")
     return me["id"]
 
 
@@ -124,7 +136,7 @@ def load(path, default):
 
 def save(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # 原子写: tmp + fsync + os.replace, 防止并发/中途失败留下半截文件
+    # atomic write: tmp + fsync + os.replace, no half-written files on crash/concurrency
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
@@ -136,15 +148,15 @@ def save(path, obj):
 def channel_id():
     cfg = load(CONFIG, {})
     if not cfg.get("channel_id"):
-        sys.exit("❌ 未配置频道: 先跑 --discover 再 --use-channel <id>")
+        sys.exit("❌ channel not configured: run --discover then --use-channel <id>")
     return cfg["channel_id"]
 
 
 def post(text):
-    if len(text) > 1900:  # Discord 单条上限 2000 字符, 留余量
-        text = text[:1890] + "\n…(截断)"
+    if len(text) > 1900:  # Discord 2000-char limit per message, leave headroom
+        text = text[:1890] + "\n…(truncated)"
     st, _ = api("POST", f"/channels/{channel_id()}/messages", {"content": text})
-    print("✅ 已回帖" if st == 200 else f"❌ 回帖失败 HTTP {st}")
+    print("✅ posted" if st == 200 else f"❌ post failed HTTP {st}")
 
 
 def discover():
@@ -152,73 +164,83 @@ def discover():
     print(f"bot: {me.get('username')} (id={me['id']})")
     st, guilds = api("GET", "/users/@me/guilds")
     if st != 200 or not guilds:
-        print(f"bot 不在任何服务器里({st}), 先用邀请链接把 bot 加进你的服务器")
+        print(f"bot is in no servers ({st}); add it with an invite link first")
         return
     for g in guilds:
         st2, chs = api("GET", f"/guilds/{g['id']}/channels")
-        print(f"服务器: {g['name']} ({g['id']})")
+        print(f"server: {g['name']} ({g['id']})")
         for c in chs:
-            if c.get("type") == 0:  # 0 = 文字频道
+            if c.get("type") == 0:  # 0 = text channel
                 print(f"  #{c['name']}  id={c['id']}")
 
 
 def parse_event_req(content):
-    """解析加日程消息 → (title, start_str) or None。start_str: 'YYYY-MM-DD HH:MM' (服务器本地时区)。
-    支持: 今天/明天/后天/周X、MM-DD/MM/DD/YYYY-MM-DD、HH:MM/HH点MM/下午3点"""
-    if not any(v in content for v in EVENT_VERBS):
+    """Parse a schedule-request message → (title, start_str) or None.
+    start_str: 'YYYY-MM-DD HH:MM' (server local time).
+    Supports: today/tomorrow/day-after-tomorrow/weekday names ("next fri"), MM-DD/YYYY-MM-DD,
+    HH:MM, "3pm"/"3:30pm", "half past 2"."""
+    if not any(v in content.lower() for v in EVENT_VERBS):
         return None
     rest = content
-    for v in sorted(EVENT_VERBS, key=len, reverse=True):  # 长动词先替换, 防「添加日程」被「加日程」先拆
-        rest = rest.replace(v, " ")
+    for v in sorted(EVENT_VERBS, key=len, reverse=True):  # longest verb first, avoid partial strips
+        rest = re.sub(re.escape(v), " ", rest, flags=re.I)
     today = datetime.date.today()
     d = None
-    m = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})", rest)
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", rest)
     if m:
         d = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
     else:
-        m = re.search(r"(\d{1,2})[-/月](\d{1,2})", rest)
+        m = re.search(r"(\d{1,2})[-/](\d{1,2})", rest)
         if m:
             d = datetime.date(today.year, int(m.group(1)), int(m.group(2)))
-        elif "后天" in rest:
+        elif re.search(r"day after tomorrow", rest, re.I):
             d = today + datetime.timedelta(days=2)
-        elif "明天" in rest or "明日" in rest:
+        elif re.search(r"tomorrow", rest, re.I):
             d = today + datetime.timedelta(days=1)
-        elif "今天" in rest or "今日" in rest:
+        elif re.search(r"today", rest, re.I):
             d = today
         else:
-            wk = re.search(r"周([一二三四五六日天])", rest)
+            wk = re.search(r"(?:next\s+)?(mon|tue|wed|thu|fri|sat|sun)(?:day)?", rest, re.I)
             if wk:
-                names = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
-                delta = (names[wk.group(1)] - today.weekday()) % 7
-                d = today + datetime.timedelta(days=delta if delta else 7)  # 当天→下周
+                names = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+                delta = (names[wk.group(1).lower()] - today.weekday()) % 7
+                # "next X" or today → next week
+                if re.search(r"next", rest, re.I) or delta == 0:
+                    delta = 7 if delta == 0 else delta
+                d = today + datetime.timedelta(days=delta)
             else:
                 d = today
     hh, mm = 9, 0
-    m = re.search(r"(\d{1,2})点半", rest)  # 「2点半」→ 14:30
+    m = re.search(r"half past (\d{1,2})", rest, re.I)   # "half past 2" → 2:30
     if m:
         hh, mm = int(m.group(1)), 30
     else:
-        m = re.search(r"(\d{1,2})[:：点时](\d{1,2})?分?", rest)  # 支持「14:30」「3点」「3点30」
+        m = re.search(r"(\d{1,2}):(\d{2})", rest)       # "14:30" / "3:30"
         if m:
-            hh = int(m.group(1))
-            mm = int(m.group(2)) if m.group(2) else 0
+            hh, mm = int(m.group(1)), int(m.group(2))
         else:
-            m = re.search(r"(\d{2})(\d{2})", rest)
-            if m and 0 <= int(m.group(1)) <= 23:
-                hh, mm = int(m.group(1)), int(m.group(2))
-    if ("下午" in rest or "晚上" in rest or "今晚" in rest) and hh < 12:
+            m = re.search(r"(\d{1,2})\s*(am|pm)", rest, re.I)   # "3pm" / "9am"
+            if m:
+                hh, mm = int(m.group(1)), 0
+    if re.search(r"\bpm\b", rest, re.I) and hh < 12:
         hh += 12
-    title = re.sub(r"今天|今日|明天|明日|后天|今晚|周[一二三四五六日天]|"
-                   r"\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|\d{1,2}[-/月]\d{1,2}|"
-                   r"\d{1,2}点半|\d{1,2}[:：点时]\d{1,2}分?|\d{1,2}点|\d{4}|\d{2}\d{2}|上午|下午|晚上", " ", rest)
-    title = " ".join(title.split())
+    if re.search(r"\bam\b", rest, re.I) and hh >= 12:
+        hh %= 12
+    title = re.sub(
+        r"today|tomorrow|day after tomorrow|\bnext\b|"
+        r"\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b|"
+        r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}|\d{1,2}:\d{2}|"
+        r"half past \d{1,2}|\d{1,2}\s*(?:am|pm)|add event|schedule|new event|book|at\b",
+        " ", rest, flags=re.I)
+    title = " ".join(title.split()).strip(" at ")
     if not title:
-        title = "日程"
+        title = "Event"
     return title, f"{d.isoformat()} {hh:02d}:{mm:02d}"
 
 
 def enqueue_event(title, start, content, snowflake, author):
-    """加日程请求入队(待 Mac 写入日历)。poll.lock 串行 + 原子写, 与 tasks.json 同模式"""
+    """Queue a schedule request (written to the macOS calendar by the sync script).
+    Serialized by poll.lock + atomic write, same pattern as tasks.json"""
     q = load(EVENT_QUEUE, {"items": [], "next_id": 1})
     eid = q["next_id"]
     q["next_id"] += 1
@@ -231,27 +253,28 @@ def enqueue_event(title, start, content, snowflake, author):
 
 
 def event_replies():
-    """poll 末尾: 检查已由 Mac 写入/失败的日程请求 → 回帖结果 → 从队列移除"""
+    """End of poll: check schedule requests already written/failed by macOS → reply → remove from queue"""
     q = load(EVENT_QUEUE, {"items": []})
     done = [it for it in q["items"] if it["status"] in ("done", "failed")]
     if not done:
         return
     for it in done:
         if it["status"] == "done":
-            post(f"📅 日程已写入 Agent 日历（iCloud 同步）: 《{it['title']}》 {it['start']}")
+            post(f"📅 Event written to the {CALENDAR_NAME} calendar (iCloud-synced): {it['title']} @ {it['start']}")
         else:
-            post(f"❌ 日程写入失败: 《{it['title']}》 {it['start']} —— {it['result']}")
+            post(f"❌ Event write failed: {it['title']} @ {it['start']} — {it['result']}")
     q["items"] = [it for it in q["items"] if it["status"] not in ("done", "failed")]
     save(EVENT_QUEUE, q)
-    print(f"✅ 日程回执 {len(done)} 条已发, 队列剩余 {len(q['items'])}")
+    print(f"✅ sent {len(done)} event replies, {len(q['items'])} still queued")
 
 
 def _rule_query(content):
-    """规则查询判定: 命中触发词 且 剥掉触发词后剩余为空或含疑问词 → 视为查询(不入池)"""
+    """Rule-query check: trigger word hit and the remainder (after stripping it) is
+    empty or question-like → treat as a query (no pool entry)"""
     hits = set()
     low = content.lower()
     for rule, words in RULE_WORDS.items():
-        if not any(w.lower() in low for w in words):
+        if not any(w in low for w in words):
             continue
         rest = content
         for w in words:
@@ -269,105 +292,115 @@ def radar_reply():
     except OSError:
         days = []
     if not days:
-        return "📡 雷达还没产出过内容(每天 8:37 自动跑)。"
+        return "📡 Radar has no output yet (runs daily)."
     data = load(os.path.join(pub, days[-1] + ".json"), {})
     cards = data.get("cards", [])
     if not cards:
-        return f"📡 雷达 {days[-1]}: 无卡片。"
-    lines = [f"📡 雷达 {days[-1]} · {len(cards)} 张卡片:"]
+        return f"📡 Radar {days[-1]}: no cards."
+    lines = [f"📡 Radar {days[-1]} · {len(cards)} cards:"]
     for c in cards:
         lines.append(f"• [{c.get('score', '?')}] {c.get('title', '')[:90]} ({c.get('source', '?')})")
         url = c.get("sourceUrl", "")
         if url:
             lines.append(f"  {url}")
     reply = "\n".join(lines)
-    return reply if len(reply) <= 1800 else reply[:1790] + "\n…(截断, 其余见 reports/radar.html)"
+    return reply if len(reply) <= 1800 else reply[:1790] + "\n…(truncated, full report in reports/radar.html)"
 
 
 def mail_reply():
     pool = load(os.path.join(BASE, "data", "mail_ad_pending.json"), {"items": []})
     pend = [it for it in pool.get("items", []) if it.get("status") == "pending"]
     if not pend:
-        return "📬 暂无待审广告邮件。"
-    lines = [f"📬 待审广告邮件 {len(pend)} 封(说「删 #N」/「留 #N」处理):"]
+        return "📬 No pending ad-review mail."
+    lines = [f"📬 Pending ad-review mail {len(pend)} (say 'delete #N' / 'keep #N' to handle):"]
     for it in pend:
         lines.append(f"  #{it['id']} {it.get('sender', '?')} — {it.get('subject', '')[:60]}")
     return "\n".join(lines)
 
 
 def schedule_reply(content=""):
-    """读 Mac 同步的日程快照(data/calendar_today.json, 每 30 分钟推送), 与 daily_push 同源;
-    content 含「明天/明日」→ 答明日日程(快照 tomorrow 字段), 否则当日。
-    快照缺失/过期提示 Mac 未同步(服务器无 osascript, 不读 Mac 日历)"""
+    """Read the macOS-synced calendar snapshot (data/calendar_today.json, pushed every 30 min),
+    same source as the morning digest; content contains 'tomorrow' → tomorrow's events
+    (snapshot 'tomorrow' field), else today's. Missing/stale snapshot → "macOS not synced"
+    (servers have no osascript and do not read the macOS calendar)"""
     snap_path = os.path.join(BASE, "data", "calendar_today.json")
     try:
         snap = json.load(open(snap_path, encoding="utf-8"))
     except (OSError, ValueError):
-        return "📅 日程快照缺失（Mac 未同步，等下次 sync 后重试）。"
+        return "📅 Schedule snapshot missing (macOS not synced, retry after the next sync)."
     if snap.get("date") != time.strftime("%Y-%m-%d"):
-        return "📅 日程快照过期（最后同步 %s），Mac 未同步。" % snap.get("date", "?")
-    tomorrow_q = "明天" in content or "明日" in content
+        return "📅 Schedule snapshot stale (last sync %s) — macOS not synced." % snap.get("date", "?")
+    tomorrow_q = "tomorrow" in content.lower()
     evs = [tuple(e) for e in snap.get("tomorrow" if tomorrow_q else "events", []) if len(e) == 3]
     evs.sort(key=lambda x: x[0])
     if not evs:
-        return "📅 明日无日程。" if tomorrow_q else "📅 今日无日程。"
-    lines = ["📅 明日日程:" if tomorrow_q else "📅 今日日程:"]
+        return "📅 No events tomorrow." if tomorrow_q else "📅 No events today."
+    lines = ["📅 Tomorrow:" if tomorrow_q else "📅 Today:"]
     for hhmm, cal, title in evs:
-        tag = "" if cal == "Agent" else f"（{cal}）"
+        tag = "" if cal == CALENDAR_NAME else f"({cal})"
         lines.append(f"• {hhmm} {title}{tag}")
     return "\n".join(lines)
 
 
 def auto_answer(content):
-    """自动问答档(纯知识, 无工具): 无头 claude -p 直接回答, 返回 (ok, text)。
-    不带 --allowedTools——无审批 shell 面被分类器否决, 动手任务走会话/入池。"""
+    """Auto-answer mode (knowledge only, no tools): headless claude -p answers directly,
+    returns (ok, text). No --allowedTools — the unapproved shell surface is rejected by the
+    safety classifier, so hands-on tasks go through a session / the pool."""
     claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
     if not claude or not os.path.exists(claude):
-        return False, "❌ 找不到 claude CLI"
+        return False, "❌ claude CLI not found"
     cfg = load(CONFIG, {})
     prompt = (
-        "你是用户的 Discord 自动问答助手(纯知识档, 无工具)。用户刚在 Discord 里 @ 你, 原文:\n\n"
+        "You are the user's Discord auto-answer assistant (knowledge only, no tools). "
+        "The user just @-mentioned you on Discord, original message:\n\n"
         f"---\n{content}\n---\n\n"
-        "用原文语言(通常中文)直接回答。你没有工具, 不能访问本机文件或执行命令; "
-        "如果请求需要动手操作(改文件/跑程序/查本机数据), 直接说「这个需要打开 Claude 会话处理」。"
-        "回答控制在 1500 字以内。"
+        "Answer directly, in the same language as the message. You have no tools — you "
+        "cannot access local files or run commands; if the request needs hands-on work "
+        "(changing files/running programs/reading local data), say 'this needs a Claude "
+        "session'. Keep the answer under 1500 characters."
     )
     cmd = [claude, "-p", "--output-format", "text", "--tools", ""]
     model = cfg.get("auto_model", "")
     if model:
         cmd += ["--model", model]
     try:
-        # 提示词走 stdin(同雷达管线; --tools 是贪婪变参, 位置参数会被吞);
-        # 剥离代理类环境变量(本机会话可能跑在 ANTHROPIC_BASE_URL 代理上, 直接继承会 401);
-        # 干净环境 = launchd 环境, 走 claude.ai 登录, 与雷达管线一致
+        # prompt via stdin (same as the radar pipeline; --tools is a greedy variadic flag and
+        # would swallow positional args); strip proxy-like env vars (a session may run behind
+        # an ANTHROPIC_BASE_URL proxy — inheriting it would 401); a clean env uses the
+        # claude.ai login, consistent with the radar pipeline
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("ANTHROPIC_", "CLAUDE_"))}
         env.setdefault("HOME", os.path.expanduser("~"))
         r = subprocess.run(cmd, input=prompt, cwd=BASE, capture_output=True,
                            text=True, timeout=240, env=env)
     except subprocess.TimeoutExpired:
-        return False, "⏱ 自动回答超时(4 分钟)"
+        return False, "⏱ auto-answer timed out (4 min)"
     if r.returncode != 0 or not (r.stdout or "").strip():
-        return False, f"❌ claude -p 失败(rc={r.returncode}): {(r.stderr or r.stdout or '')[:200]}"
+        return False, f"❌ claude -p failed (rc={r.returncode}): {(r.stderr or r.stdout or '')[:200]}"
     return True, r.stdout.strip()
 
 
 def auto_task(content):
-    """自动执行档(只读工具, 2026-08-16 用户显式授权): WebSearch/WebFetch 联网调研,
-    返回 (ok, need_session, answer)。不涉本机修改的任务直接完成; 需改本机(文件/日历/程序)
-    的由模型按合同返回 need_session=true → 入池走会话。无 Bash/Write/Edit——安全由构造保证。"""
+    """Auto-execute mode (read-only web, explicitly authorized): WebSearch/WebFetch research,
+    returns (ok, need_session, answer). Tasks that don't touch the machine are completed
+    directly; tasks that need local changes (files/calendar/programs) return need_session=true
+    via the JSON contract → pool for a session. No Bash/Write/Edit — safety by construction."""
     claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
     if not claude or not os.path.exists(claude):
-        return False, False, "❌ 找不到 claude CLI"
+        return False, False, "❌ claude CLI not found"
     prompt = (
-        "你是用户的 Discord 自动任务助手(只读档)。用户刚在 Discord 里 @ 你, 原文:\n\n"
+        "You are the user's Discord auto-task assistant (read-only mode). The user just "
+        "@-mentioned you on Discord, original message:\n\n"
         f"---\n{content}\n---\n\n"
-        "你只有联网检索工具(WebSearch/WebFetch), 没有本机工具(Bash/Write/Edit 均不可用)。\n"
-        "任务类型判定:\n"
-        "- 调研/查资料/了解某主题 → 联网检索, 用原文语言(通常中文)写结构化总结。\n"
-        "- 需要访问或修改本机(文件/日历/程序/数据库/执行代码) → 不要检索, 立即返回 need_session=true。\n"
-        "最终输出必须是 JSON, 不要任何多余文字:\n"
-        '{"need_session": false, "answer": "总结内容(要点/数字/来源, 1000 字内, 结尾附来源链接)"}'
+        "You only have web research tools (WebSearch/WebFetch), no local tools "
+        "(Bash/Write/Edit unavailable).\n"
+        "Task classification:\n"
+        "- Research / look up information → use the web, write a structured summary in the "
+        "same language as the message.\n"
+        "- Needs local access or changes (files/calendar/programs/databases/running code) → "
+        "do not research, return need_session=true immediately.\n"
+        "Final output must be JSON, nothing else:\n"
+        '{"need_session": false, "answer": "summary (key points/numbers/sources, under 1000 chars, end with source links)"}'
     )
     cmd = [claude, "-p", "--output-format", "json",
            "--allowedTools", "WebSearch,WebFetch", "--max-turns", "12"]
@@ -375,17 +408,17 @@ def auto_task(content):
     if cfg.get("auto_model", ""):
         cmd += ["--model", cfg["auto_model"]]
     try:
-        # 提示词走 stdin(贪婪变参); 剥代理环境变量(同雷达管线, 防 401)
+        # prompt via stdin (greedy variadic flag); strip proxy env vars (same as radar pipeline)
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("ANTHROPIC_", "CLAUDE_"))}
         env.setdefault("HOME", os.path.expanduser("~"))
         r = subprocess.run(cmd, input=prompt, cwd=BASE, capture_output=True,
                            text=True, timeout=600, env=env)
     except subprocess.TimeoutExpired:
-        return False, False, "⏱ 自动执行超时(10 分钟)"
+        return False, False, "⏱ auto-execute timed out (10 min)"
     if r.returncode != 0 or not (r.stdout or "").strip():
-        return False, False, f"❌ claude -p 失败(rc={r.returncode}): {(r.stderr or r.stdout or '')[:200]}"
-    try:  # 外层是 claude -p 的结果包, result 字段里是模型的最终输出(合同 JSON)
+        return False, False, f"❌ claude -p failed (rc={r.returncode}): {(r.stderr or r.stdout or '')[:200]}"
+    try:  # outer wrapper is claude -p's result; the model's final output (contract JSON) is in 'result'
         outer = json.loads(r.stdout)
         text = outer.get("result") or r.stdout
     except json.JSONDecodeError:
@@ -402,37 +435,37 @@ def auto_task(content):
 
 
 def post_task_result(cid, content, ans):
-    """调研完成: 回帖摘要 + 总结文档存 reports/discord/(HTML) 并上传频道"""
+    """Research done: reply with a summary + save the full report to reports/discord/ (HTML) and upload it"""
     title = re.sub(r"\s+", " ", content)[:40]
     rdir = os.path.join(BASE, "reports", "discord")
     os.makedirs(rdir, exist_ok=True)
     safe = re.sub(r"[^\w.\-#]", "_", title)
     path = os.path.join(rdir, f"{time.strftime('%F')}-#{cid}-{safe}.html")
     page = (
-        "<!DOCTYPE html>\n<html lang='zh-CN'><head><meta charset='utf-8'>"
-        "<title>调研 #%d</title>\n<style>"
-        "body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;"
+        "<!DOCTYPE html>\n<html lang='en'><head><meta charset='utf-8'>"
+        "<title>Research #%d</title>\n<style>"
+        "body{font-family:-apple-system,'Segoe UI',sans-serif;"
         "max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#24292f}"
         "h1{font-size:20px;border-bottom:2px solid #0969da;padding-bottom:6px}"
         ".req{background:#f0f7ff;border-left:4px solid #0969da;padding:8px 12px;margin:12px 0}"
         "pre{white-space:pre-wrap;background:#f6f8fa;padding:12px;border-radius:6px;font-size:13px}"
-        "</style></head><body><h1>调研 #%d</h1>"
-        "<div class='req'>请求: %s</div><pre>%s</pre>"
+        "</style></head><body><h1>Research #%d</h1>"
+        "<div class='req'>Request: %s</div><pre>%s</pre>"
         "</body></html>\n"
     ) % (cid, cid, html.escape(content), html.escape(ans))
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
-    head = ans if len(ans) <= 1500 else ans[:290] + f"\n…(完整 {len(ans)} 字见附件)"
-    post(f"📄 调研完成 #{cid}: {head}")
-    send_file(path, f"📄 调研总结 #{cid}: {content[:60]}")
+    head = ans if len(ans) <= 1500 else ans[:290] + f"\n…(full {len(ans)} chars in the attachment)"
+    post(f"📄 Research done #{cid}: {head}")
+    send_file(path, f"📄 Research report #{cid}: {content[:60]}")
 
 
 def send_file(path, caption):
-    """上传本地文件到 Discord 频道(multipart/form-data, 纯 stdlib)"""
+    """Upload a local file to the Discord channel (multipart/form-data, pure stdlib)"""
     if not os.path.isfile(path):
-        sys.exit(f"❌ 文件不存在: {path}")
+        sys.exit(f"❌ file not found: {path}")
     fname = re.sub(r"[^\w.-]", "_", os.path.basename(path)) or "file"
-    bnd = "----ru" + uuid.uuid4().hex
+    bnd = "----" + uuid.uuid4().hex
     with open(path, "rb") as f:
         data = f.read()
     body = (f"--{bnd}\r\n"
@@ -444,27 +477,27 @@ def send_file(path, caption):
     req = urllib.request.Request(API + f"/channels/{channel_id()}/messages",
                                  method="POST", data=body)
     req.add_header("Authorization", "Bot " + token())
-    req.add_header("User-Agent", "ru-discord-bridge")
+    req.add_header("User-Agent", "my-daily-tools-discord-bridge")
     req.add_header("Content-Type", f"multipart/form-data; boundary={bnd}")
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
-            print("✅ 文件已发送" if r.status == 200 else f"❌ 发送失败 {r.status}")
+            print("✅ file sent" if r.status == 200 else f"❌ send failed {r.status}")
     except urllib.error.HTTPError as e:
-        print(f"❌ 发送失败 HTTP {e.code}: {e.read().decode()[:200]}")
+        print(f"❌ send failed HTTP {e.code}: {e.read().decode()[:200]}")
 
 
 def ongoing_reply(tasks):
-    """任务清单查询回帖: ongoing.md 进行中/待办(主) + 收件桥池内待办(次)"""
-    rows = {"进行中": [], "待办": []}
+    """List-query reply: ongoing.md active/todo (main) + bridge pool pending (secondary)"""
+    rows = {"in-progress": [], "todo": []}
     section = None
     try:
         with open(os.path.join(BASE, "ongoing.md"), encoding="utf-8") as f:
             for ln in f:
-                if ln.startswith("## 🚧 进行中"):
-                    section = "进行中"
+                if ln.startswith(ONGOING_HEADERS["in-progress"]):
+                    section = "in-progress"
                     continue
-                if ln.startswith("## 🗓 待办"):
-                    section = "待办"
+                if ln.startswith(ONGOING_HEADERS["todo"]):
+                    section = "todo"
                     continue
                 if ln.startswith("## "):
                     section = None
@@ -472,18 +505,19 @@ def ongoing_reply(tasks):
                 if not section or not ln.startswith("|") or "---" in ln:
                     continue
                 cells = [re.sub(r"\*+", "", c).strip() for c in ln.strip().strip("|").split("|")]
-                if len(cells) < 2 or cells[0] in ("任务",):
+                if len(cells) < 2 or cells[0] in ("task", "Task"):
                     continue
                 rows[section].append((cells[0], cells[1] if len(cells) > 1 else "",
                                       cells[2] if len(cells) > 2 else "",
                                       cells[3] if len(cells) > 3 else ""))
     except OSError:
         pass
+    labels = {"in-progress": "🚧 In progress", "todo": "🗓 Todo"}
     parts = []
-    for section in ("进行中", "待办"):
+    for section in ("in-progress", "todo"):
         if not rows[section]:
             continue
-        parts.append(("🚧 " if section == "进行中" else "🗓 ") + section + ":")
+        parts.append(labels[section] + ":")
         for name, pri, dl, prog in rows[section]:
             meta = " ".join(x for x in (pri, dl) if x and x != "—")
             line = f"• {name}"
@@ -493,44 +527,45 @@ def ongoing_reply(tasks):
                 line += f" — {prog[:40]}"
             parts.append(line)
     if not parts:
-        parts.append("(ongoing.md 为空)")
+        parts.append("(ongoing.md is empty)")
     pend = [it for it in tasks["items"] if it["status"] == "pending"]
     if pend:
-        parts.append("📥 收件桥待办:")
+        parts.append("📥 Bridge pool pending:")
         parts += [f"  #{it['id']} [{it['author']}] {it['content'][:60]}" for it in pend]
-    reply = "📋 当前任务:\n" + "\n".join(parts)
-    return reply if len(reply) <= 1900 else reply[:1890] + "\n…(截断, 详情见 ongoing.md)"
+    reply = "📋 Current tasks:\n" + "\n".join(parts)
+    return reply if len(reply) <= 1900 else reply[:1890] + "\n…(truncated, see ongoing.md)"
 
 
 def poll():
     ch = channel_id()
     st, msgs = api("GET", f"/channels/{ch}/messages?limit=50")
     if st != 200:
-        print(f"❌ 拉取消息失败 HTTP {st}")
+        print(f"❌ fetch messages failed HTTP {st}")
         return
     state = load(STATE, {"last_id": "0"})
     tasks = load(TASKS, {"items": [], "next_id": 1})
     last = state.get("last_id", "0")
     if not msgs:
-        print("频道无消息")
+        print("channel has no messages")
         return
     newest = max(m["id"] for m in msgs)
     if newest == last:
-        print("无新消息")
+        print("no new messages")
         return
     bid = bot_id()
     cfg = load(CONFIG, {})
     role_ids = cfg.get("role_ids", [])
     auto = cfg.get("auto_exec", False)
-    # 关键: 过滤机器人自己的消息——回执文本里的 <@bot> 会被 Discord 解析成真 mention,
-    # 不过滤会导致"回执→再收录→再回执"无限循环
+    # key: filter the bot's own messages — <@bot> in reply texts is parsed as a real mention
+    # by Discord; not filtering would cause reply → re-capture → reply, forever
     def touched(m):
         if m["author"]["id"] == bid:
             return False
         if any(u["id"] == bid for u in m.get("mentions", [])):
             return True
         c = m.get("content") or ""
-        # 用户常 @角色而不是 @机器人; 不可 mention 的角色不会进 mention_roles, 需扫原文
+        # users often @ a role instead of the bot; unmentionable roles don't appear in
+        # mention_roles, so scan the raw text too
         return any(f"<@&{r}>" in c for r in role_ids) or \
             any(r in m.get("mention_roles", []) for r in role_ids)
 
@@ -538,9 +573,9 @@ def poll():
     state["last_id"] = newest
     save(STATE, state)
     if not fresh:
-        print("无新 @消息")
+        print("no new @ messages")
         return
-    lines = ["✅ 收到任务:"]
+    lines = ["✅ Tasks received:"]
     queried = False
     rules = set()
     rule_msgs = {}
@@ -551,27 +586,30 @@ def poll():
             continue
         if _is_task_query(content):
             queried = True
-            print(f"清单查询: {content[:40]}")
+            print(f"list query: {content[:40]}")
             continue
         ev = parse_event_req(content)
         if ev:
-            # 加日程: 入队等待 Mac 写入 Agent 日历 (先于规则查询, 避免「安排日程」被 schedule 规则误判)
+            # schedule request: enqueue for the macOS calendar write (before rule queries,
+            # so "schedule" isn't misread by the schedule rule)
             title, start = ev
             eid = enqueue_event(title, start, content, m["id"], m["author"]["username"])
-            print(f"加日程 #{eid}: 《{title}》 {start}")
-            post(f"📅 已收到加日程请求 #{eid}: 《{title}》 {start} → 将写入 Agent 日历(iCloud 同步), Mac 同步后回执。")
+            print(f"event #{eid}: «{title}» {start}")
+            post(f"📅 Schedule request #{eid} received: «{title}» {start} → will be written "
+                 f"to the {CALENDAR_NAME} calendar (iCloud-synced), confirmed after the macOS sync.")
             continue
         hits = _rule_query(content)
         if hits:
             rules |= hits
             for r in hits:
                 rule_msgs[r] = content
-            print(f"规则查询 {sorted(hits)}: {content[:40]}")
+            print(f"rule query {sorted(hits)}: {content[:40]}")
             continue
-        if auto and "入池" not in content and any(k in content for k in AUTO_QUESTION):
-            # 自动问答档(纯知识, 无工具): 疑问式消息 → 无头 claude -p 回答回帖; 失败才落池
-            print(f"自动问答: {content[:40]}")
-            post(f"🤖 收到「{content[:50]}」, 自动回答中(约 1 分钟)…")
+        if auto and FORCE_POOL not in content and any(k in content.lower() for k in AUTO_QUESTION):
+            # auto-answer mode (knowledge only, no tools): question-like messages → headless
+            # claude -p answers inline; on failure the task falls into the pool
+            print(f"auto-answer: {content[:40]}")
+            post(f"🤖 Got «{content[:50]}», answering automatically (about a minute)…")
             ok, ans = auto_answer(content)
             cid = tasks["next_id"]
             tasks["next_id"] += 1
@@ -583,13 +621,16 @@ def poll():
                                    "auto_result": ans[:500] if ok else None})
             save(TASKS, tasks)
             if ok:
-                post("🤖 回答: " + ans[:1800])
+                post("🤖 Answer: " + ans[:1800])
             else:
-                post(f"❌ 自动回答失败: {ans[:300]}\n已入池 #{cid}——打开 Claude 会话时说「处理 Discord 待办」接手。")
+                post(f"❌ Auto-answer failed: {ans[:300]}\npooled as #{cid} — say 'handle the "
+                     f"Discord todo list' in a Claude session to take over.")
             continue
-        if auto and "入池" not in content:
-            # 自动执行档(只读联网, 用户 2026-08-16 授权): 调研类任务直接完成回帖总结文档;
-            # 需改本机(文件/日历/程序)的按合同 need_session 转池。先占位入池防长调研期间重复收录。
+        if auto and FORCE_POOL not in content:
+            # auto-execute mode (read-only web, explicitly authorized): research-type tasks
+            # complete directly with a summary; tasks needing local changes (files/calendar/
+            # programs) return need_session via the contract → pool. Reserve the id first so
+            # a long research run doesn't capture the message twice.
             cid = tasks["next_id"]
             tasks["next_id"] += 1
             appended.append(cid)
@@ -597,7 +638,8 @@ def poll():
                     "content": content, "created": m.get("timestamp"), "status": "pending"}
             tasks["items"].append(item)
             save(TASKS, tasks)
-            post(f"📝 开始处理 #{cid}「{content[:50]}」(自动档: 只读联网调研, 需本机动手会自动转池)…")
+            post(f"📝 Processing #{cid} «{content[:50]}» (auto mode: read-only web research; "
+                 f"local hands-on work is auto-pooled)…")
             ok, need_session, ans = auto_task(content)
             if ok and not need_session:
                 item["status"] = "auto"
@@ -605,9 +647,11 @@ def poll():
                 save(TASKS, tasks)
                 post_task_result(cid, content, ans)
             elif not ok:
-                post(f"❌ 自动执行失败: {ans[:200]}\n已入池 #{cid}——打开 Claude 会话时说「处理 Discord 待办」接手。")
+                post(f"❌ Auto-execute failed: {ans[:200]}\npooled as #{cid} — say 'handle the "
+                     f"Discord todo list' in a Claude session to take over.")
             else:
-                post(f"📝 #{cid} 需要本机动手(自动档无此权限), 已入池——打开 Claude 会话时说「处理 Discord 待办」接手。")
+                post(f"📝 #{cid} needs local hands-on work (auto mode has no such access), pooled — "
+                     f"say 'handle the Discord todo list' in a Claude session to take over.")
             continue
         cid = tasks["next_id"]
         tasks["next_id"] += 1
@@ -616,23 +660,25 @@ def poll():
                                "author": m["author"]["username"],
                                "content": content, "created": m.get("timestamp"),
                                "status": "pending"})
-        print(f"新任务 #{cid}: {content[:60]}")
+        print(f"new task #{cid}: {content[:60]}")
         lines.append(f"  #{cid} {content[:80]}")
     save(TASKS, tasks)
     if appended:
-        # 自检: 曾出现"回执已发但池里任务丢失"(#2), 重读确认, 丢了就重写一次
+        # self-check: tasks were once lost after the receipt was sent (#2); re-read and
+        # rewrite if anything is missing
         have = {it["id"] for it in load(TASKS, {}).get("items", [])}
         missing = [c for c in appended if c not in have]
         if missing:
-            print(f"⚠ 池保存异常, 重写 (缺 {missing})")
+            print(f"⚠ pool save anomaly, rewriting (missing {missing})")
             save(TASKS, tasks)
     if queried:
-        # "任务清单"类查询 → 不回执不入池, 回帖 ongoing.md 任务清单(主) + 收件桥待办(次)
+        # list-type queries → no receipt/no pool entry; reply with the ongoing.md list
+        # (main) + bridge pool pending (secondary)
         reply = ongoing_reply(tasks)
         print(reply)
         post(reply)
     for rule in sorted(rules):
-        # 规则查询(雷达/邮件待审/日程) → 直接回帖本地数据, 不入池
+        # rule queries (radar / mail pending / schedule) → answer from local data, no pool entry
         if rule == "schedule":
             reply = schedule_reply(rule_msgs.get("schedule", ""))
         else:
@@ -640,29 +686,30 @@ def poll():
         print(reply)
         post(reply)
     if len(lines) > 1:
-        lines.append("打开 Claude 会话时处理, 完成后会回帖")
+        lines.append("handled in a Claude session, results will be posted back")
         post("\n".join(lines))
-    event_replies()  # 加日程回执: Mac 写入结果 → 回帖 → 清理
+    event_replies()  # schedule receipts: macOS write results → reply → cleanup
 
 
 def list_tasks():
     tasks = load(TASKS, {"items": []})
     pend = [it for it in tasks["items"] if it["status"] == "pending"]
     if not pend:
-        print("待办池为空")
+        print("pool is empty")
         return
     for it in pend:
         print(f"#{it['id']} [{it['author']}] {it['content'][:80]} ({it['created']})")
 
 
 def done(num, result):
-    # 与 --poll 同一把锁: done 的读-改-写若不串行, 会覆盖 poll 刚收录的任务(#2 丢失教训)
+    # same lock as --poll: a non-serialized read-modify-write here would overwrite tasks
+    # poll just captured (the #2 loss lesson)
     lf = open(LOCK, "w")
     try:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("⚠ 轮询进行中, 稍后再试")
+            print("⚠ poll in progress, try again later")
             return
         tasks = load(TASKS, {"items": []})
         for it in tasks["items"]:
@@ -670,25 +717,26 @@ def done(num, result):
                 it["status"] = "done"
                 it["done_at"] = time.strftime("%F %T")
                 save(TASKS, tasks)
-                print(f"✅ #{num} 已标记完成")
+                print(f"✅ #{num} marked done")
                 if result:
-                    post(f"✅ 任务 #{num} 完成: {result[:300]}")
+                    post(f"✅ Task #{num} done: {result[:300]}")
                 return
-        print(f"❌ 找不到待办 #{num}")
+        print(f"❌ no pending task #{num}")
     finally:
         fcntl.flock(lf, fcntl.LOCK_UN)
         lf.close()
 
 
 def cleanup(keep=10):
-    """归档历史已完成任务: 保留最近 keep 条结束态(done/auto), 其余移到 archive.json。
-    与 poll 同一把锁——读-改-写不串行会覆盖 poll 刚收录的任务(#2 教训)。"""
+    """Archive finished tasks: keep the last `keep` terminal-state items (done/auto),
+    move the rest to archive.json. Same lock as poll — a non-serialized read-modify-write
+    would overwrite tasks poll just captured (the #2 lesson)."""
     lf = open(LOCK, "w")
     try:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("⚠ 轮询进行中, 稍后再试")
+            print("⚠ poll in progress, try again later")
             return
         tasks = load(TASKS, {"items": []})
         items = tasks["items"]
@@ -696,7 +744,7 @@ def cleanup(keep=10):
                           key=lambda it: it.get("id", 0))
         old = finished[:-keep] if len(finished) > keep else []
         if not old:
-            print(f"✅ 无需清理（结束态 {len(finished)} 条 ≤ 保留 {keep} 条）")
+            print(f"✅ nothing to clean (terminal state {len(finished)} ≤ keep {keep})")
             return
         archive = load(ARCHIVE, {"archived": []})
         for it in old:
@@ -707,21 +755,22 @@ def cleanup(keep=10):
         old_ids = {id(it) for it in old}
         tasks["items"] = [it for it in items if id(it) not in old_ids]
         save(TASKS, tasks)
-        print(f"✅ 归档 {len(old)} 条到 {os.path.basename(ARCHIVE)}，池内剩 {len(tasks['items'])} 条"
-              f"（结束态保留最近 {min(keep, len(finished))} 条）")
+        print(f"✅ archived {len(old)} to {os.path.basename(ARCHIVE)}, {len(tasks['items'])} left "
+              f"(keeping the latest {min(keep, len(finished))} terminal-state items)")
     finally:
         fcntl.flock(lf, fcntl.LOCK_UN)
         lf.close()
 
 
 def _poll_locked():
-    # 防并发重入: launchd 每 60s 一轮, 手动跑 --poll 若与自动轮重叠会双发回帖/重复收录
+    # re-entrancy guard: the scheduler polls every 60s; a manual --poll overlapping the
+    # automatic round would double-post / double-capture
     lf = open(LOCK, "w")
     try:
         try:
             fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            print("上次轮询未结束, 跳过")
+            print("previous poll still running, skipping")
             return
         poll()
     finally:
@@ -737,12 +786,12 @@ def main():
         cfg = load(CONFIG, {})
         cfg["channel_id"] = argv[argv.index("--use-channel") + 1]
         save(CONFIG, cfg)
-        print("✅ 频道已配置")
+        print("✅ channel configured")
     elif "--add-role" in argv:
         cfg = load(CONFIG, {})
         cfg.setdefault("role_ids", []).append(argv[argv.index("--add-role") + 1])
         save(CONFIG, cfg)
-        print("✅ 已添加触发角色")
+        print("✅ trigger role added")
     elif "--poll" in argv:
         _poll_locked()
     elif "--list" in argv:

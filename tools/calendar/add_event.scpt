@@ -9,7 +9,7 @@ on run
 			set minutes of startDate to 0
 			set seconds of startDate to 0
 			set endDate to startDate + (1 * hours)
-			make new event with properties {summary:"Newport 工程师看气浮", start date:startDate, end date:endDate}
+			make new event with properties {summary:"Event name", start date:startDate, end date:endDate}
 		end tell
 	end tell
 end run

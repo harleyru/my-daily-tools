@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""研究雷达每日编排: fetch → prefilter → editorial(claude -p) → 合同校验 → 静态站点 → 飞书推送
+"""Research radar daily orchestration: fetch → prefilter → editorial (claude -p)
+→ contract check → static site → notify.
 
-由调度器每天调用一次。日志走 stdout(自行重定向到日志文件)。
-编辑台用 claude -p 无头模式, 输出按 frozen v1 合同校验, 违规自动重试一次。
-用法: python3 radar_daily.py [YYYY-MM-DD] [--skip-fetch] [--skip-editorial] [--skip-notify]
+Called once a day by the scheduler. Logs go to stdout (redirect to a log file yourself).
+The editorial stage runs headless claude -p; output is validated against the frozen v1
+contract, with one automatic retry on violations.
+Usage: python3 radar_daily.py [YYYY-MM-DD] [--skip-fetch] [--skip-editorial] [--skip-notify]
 """
 import glob
 import json
@@ -15,7 +17,7 @@ import sys
 from datetime import datetime, timezone
 
 BASE = os.environ.get("DAILY_BASE") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = os.path.join(BASE, "scripts")
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))  # radar_fetch.py / radar_prefilter.py live here
 RADAR = os.path.join(BASE, "data", "radar")
 RAW = os.path.join(RADAR, "raw")
 EDITORIAL = os.path.join(RADAR, "editorial")
@@ -43,7 +45,7 @@ def valid_iso(s):
 
 
 def validate_day(day):
-    """frozen v1 合同移植自 pipeline/frozen_contract.mjs。返回违规列表。"""
+    """frozen v1 contract (ported from pipeline/frozen_contract.mjs). Returns a list of violations."""
     v = []
     add = lambda p, m: v.append(f"{p}: {m}")
     root_keys = {"date", "generatedAt", "status", "stats", "cards"}
@@ -145,18 +147,19 @@ def validate_ledger(led):
 
 
 def find_claude():
-    # 优先 RADAR_EDITOR 环境变量(任意 Anthropic 兼容 CLI), 回退 claude
+    # RADAR_EDITOR env var first (any Anthropic-compatible CLI), fall back to claude
     p = os.environ.get("RADAR_EDITOR") or shutil.which("claude")
     return p if os.path.exists(p) else None
 
 
 def run_editorial(date, candidates, meta):
-    """调 claude -p 编辑台, 返回 (day, ledger); 合同违规自动重试一次。"""
+    """Run the editorial stage via claude -p, returns (day, ledger);
+    one automatic retry on contract violations."""
     claude = find_claude()
     if not claude:
-        print("❌ 找不到 claude CLI")
+        print("❌ claude CLI not found")
         return None, None
-    # 只保留合同所需字段 + 文本, 控制提示词体积
+    # keep only the fields the contract needs + text, to control prompt size
     slim = [{"id": it["id"], "source": it["source"], "sourceUrl": it["sourceUrl"],
              "title": it["title"], "author": it.get("author"),
              "publishedAt": it.get("publishedAt"), "text": it.get("text", ""),
@@ -164,39 +167,39 @@ def run_editorial(date, candidates, meta):
             for it in candidates[:CONFIG.get("maxEditorialItems", 40)]]
     payload = {"__meta__": meta, "candidates": slim}
     prompt = (PROMPT_TPL.replace("{DATE}", date).replace("{PROFILE}", PROFILE)
-              + "\n\n## 当天输入\n" + json.dumps(payload, ensure_ascii=False))
+              + "\n\n## Input for the day\n" + json.dumps(payload, ensure_ascii=False))
 
     for attempt in (1, 2):
-        print(f"[editorial] claude -p 第 {attempt} 次 (候选 {len(slim)} 条)...")
+        print(f"[editorial] claude -p attempt {attempt} ({len(slim)} candidates)...")
         try:
             r = subprocess.run([claude, "-p", "--output-format", "json"],
                                input=prompt, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:
-            print("❌ editorial 超时(900s)")
+            print("❌ editorial timeout (900s)")
             return None, None
         if r.returncode != 0:
-            print(f"❌ claude 退出码 {r.returncode}: {r.stderr[-300:]}")
+            print(f"❌ claude exit code {r.returncode}: {r.stderr[-300:]}")
             return None, None
         out = _parse_result(r.stdout)
         if out is None:
-            print("❌ 输出无法解析为 JSON")
+            print("❌ output is not parseable JSON")
             continue
         day, ledger = out.get("day"), out.get("ledger")
         if not isinstance(day, dict) or not isinstance(ledger, dict):
-            print("❌ 输出缺 day/ledger 对象")
+            print("❌ missing day/ledger objects")
             continue
         day_v = validate_day(day)
         led_v = validate_ledger(ledger)
         if not day_v and not led_v:
             return day, ledger
-        print(f"⚠️ 合同违规 {len(day_v) + len(led_v)} 条, 反馈重试")
-        prompt += "\n\n## 上次输出违反契约, 修正后重新输出\n" + \
+        print(f"⚠️ {len(day_v) + len(led_v)} contract violations, retrying with feedback")
+        prompt += "\n\n## Last output violated the contract — fix it and output again\n" + \
                   "\n".join((day_v + led_v)[:30])
     return None, None
 
 
 def _parse_result(stdout):
-    """claude -p --output-format json 的结果: {"result": "<模型输出>"}。"""
+    """claude -p --output-format json result: {"result": "<model output>"}."""
     try:
         outer = json.loads(stdout)
     except json.JSONDecodeError:
@@ -206,12 +209,12 @@ def _parse_result(stdout):
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  JSON 解析失败: {e}")
+        print(f"  JSON parse failed: {e}")
         return None
 
 
 def build_site():
-    """public/*.json → reports/radar.html(自包含、中文、深色模式)。"""
+    """public/*.json → reports/radar.html (self-contained, dark mode)."""
     days = []
     for p in sorted(glob.glob(os.path.join(PUBLIC, "*.json")), reverse=True):
         try:
@@ -221,10 +224,10 @@ def build_site():
         if len(days) >= CONFIG.get("siteDays", 7):
             break
     if not days:
-        print("⚠️ public/ 为空, 跳过站点生成")
+        print("⚠️ public/ is empty, skipping site build")
         return
 
-    # 验证过的色板: 5 个 track 各取一个分类色(亮/暗)
+    # validated palette: one categorical hue per track (light/dark)
     light = {"T1": "#2a78d6", "T2": "#eb6834", "T3": "#1baf7a", "T4": "#eda100", "T5": "#e87ba4"}
     dark = {"T1": "#3987e5", "T2": "#d95926", "T3": "#199e70", "T4": "#c98500", "T5": "#d55181"}
     sections = []
@@ -243,23 +246,23 @@ def build_site():
   </div>
   <p class="summary">{esc(c['summary'])}</p>
   {why}
-  <div class="meta">{esc(c['source'])} · {esc(c['author'] or '')} · {esc((c['publishedAt'] or '')[:10])} · 交叉: {xhits}</div>
+  <div class="meta">{esc(c['source'])} · {esc(c['author'] or '')} · {esc((c['publishedAt'] or '')[:10])} · cross: {xhits}</div>
 </article>""")
         date_label = d.get("date", "?")
         open_attr = " open" if d is days[0] else ""
         sections.append(f"""<details class="day"{open_attr}>
-<summary>{esc(date_label)} · {len(d.get('cards', []))} 张卡片 · {esc(d.get('status', ''))}</summary>
+<summary>{esc(date_label)} · {len(d.get('cards', []))} cards · {esc(d.get('status', ''))}</summary>
 {''.join(cards)}
 </details>""")
     html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>研究雷达</title>
+<title>Research Radar</title>
 <style>
 :root {{ --bg:#fafafa; --surface:#ffffff; --ink:#1a1a1a; --ink2:#555555; --muted:#8a8a8a; --line:#e3e3e3; }}
 @media (prefers-color-scheme: dark) {{ :root {{ --bg:#16161a; --surface:#1e1e24; --ink:#ececf1; --ink2:#b4b4be; --muted:#7a7a85; --line:#33333d; }} }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; background:var(--bg); color:var(--ink); font:15px/1.65 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }}
+body {{ margin:0; background:var(--bg); color:var(--ink); font:15px/1.65 -apple-system,"Segoe UI",sans-serif; }}
 header {{ padding:28px 24px 8px; max-width:900px; margin:0 auto; }}
 h1 {{ font-size:22px; margin:0 0 4px; }}
 header p {{ color:var(--muted); margin:0 0 16px; font-size:13px; }}
@@ -284,12 +287,12 @@ main {{ max-width:900px; margin:0 auto; padding:0 24px 48px; }}
 .t-T4 {{ background:{dark['T4']}; }} .t-T5 {{ background:{dark['T5']}; }}
 }}
 </style></head><body>
-<header><h1>📡 研究雷达</h1><p>arXiv · RSS · HN → 关键词预筛 → LLM 编辑部打分。兴趣画像: data/radar/interest-profile.md</p></header>
+<header><h1>📡 Research Radar</h1><p>arXiv · RSS · HN → keyword prefilter → LLM editorial scoring. Interest profile: data/radar/interest-profile.md</p></header>
 <main>{''.join(sections)}</main>
 </body></html>"""
     with open(SITE, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"✅ 站点 → {SITE} ({len(days)} 天)")
+    print(f"✅ site → {SITE} ({len(days)} days)")
 
 
 def esc(s):
@@ -300,16 +303,16 @@ def esc(s):
 def notify(date, day):
     cards = day.get("cards", [])
     if not cards:
-        print("无卡片, 跳过推送")
+        print("no cards, skipping push")
         return
-    lines = [f"📡 研究雷达 {date[5:]}｜{len(cards)} 张卡片"]
+    lines = [f"📡 Research Radar {date[5:]} | {len(cards)} cards"]
     for c in cards[:5]:
         url = c["sourceUrl"]
         if len(url) > 60:
             url = url[:60] + "…"
         lines.append(f"▸ {c['score']:.1f} [{c['track']}] {c['title'][:60]} — {url}")
     subprocess.run([NOTIFY, "\n".join(lines)])
-    print("✅ 飞书已推送")
+    print("✅ pushed")
 
 
 def main():
@@ -327,20 +330,20 @@ def main():
 
     pre_path = os.path.join(RAW, date, "prefiltered.json")
     if not os.path.exists(pre_path):
-        print(f"❌ 无预筛结果 {pre_path}, 结束")
+        print(f"❌ no prefilter result {pre_path}, exiting")
         sys.exit(1)
     pre = json.load(open(pre_path, encoding="utf-8"))
     n_slim = min(len(pre["items"]), CONFIG.get("maxEditorialItems", 40))
     meta = {"fetched": pre["fetched"], "prefiltered": pre["prefiltered"], "scored": n_slim}
 
     if skip_edit:
-        print("--skip-editorial, 跳到站点/推送")
+        print("--skip-editorial, skipping to site/push")
     elif not pre["items"]:
-        print("⚠️ 无新候选(seen 表已去重), 跳过 editorial")
+        print("⚠️ no new candidates (seen table deduped), skipping editorial")
     else:
         day, ledger = run_editorial(date, pre["items"], meta)
         if day is None:
-            print("❌ editorial 失败, 本日状态 missed, 站点/推送跳过")
+            print("❌ editorial failed, day status = missed, skipping site/push")
             sys.exit(2)
         day.setdefault("date", date)
         if not day.get("stats"):
@@ -352,7 +355,7 @@ def main():
             json.dump(ledger, f, ensure_ascii=False, indent=1)
         with open(os.path.join(PUBLIC, f"{date}.json"), "w", encoding="utf-8") as f:
             json.dump(day, f, ensure_ascii=False, indent=1)
-        print(f"✅ editorial → {len(day.get('cards', []))} 张卡片")
+        print(f"✅ editorial → {len(day.get('cards', []))} cards")
 
     build_site()
     pub_path = os.path.join(PUBLIC, f"{date}.json")

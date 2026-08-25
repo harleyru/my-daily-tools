@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""研究雷达数据抓取: arXiv API + RSS(含 RDF/Atom 容错) + HN Algolia → data/radar/raw/YYYY-MM-DD/items.json
+"""Research radar data fetch: arXiv API + RSS (with RDF/Atom tolerance) + HN Algolia
+→ data/radar/raw/YYYY-MM-DD/items.json
 
-纯 stdlib (python3.9), 无第三方依赖。每个源独立 try/except, 单源失败不影响其他源;
-输出源健康报告(抓取数/错误), 供后续告警判断。
-用法: python3 radar_fetch.py [YYYY-MM-DD]
+Pure stdlib (python3.9), no third-party deps. Each source has its own try/except —
+a single source failure doesn't affect the others; outputs a source health report
+(counts/errors) for downstream alerting.
+Usage: python3 radar_fetch.py [YYYY-MM-DD]
 """
 import json
 import os
@@ -31,7 +33,7 @@ def http_get(url, timeout=30):
 
 
 def parse_iso(s):
-    """ISO8601 → UTC isoformat 或 None。"""
+    """ISO8601 → UTC isoformat, or None."""
     if not s:
         return None
     s = s.strip().replace("Z", "+00:00")
@@ -69,13 +71,13 @@ def truncate(s):
 
 
 def arxiv_id(eid):
-    """entry.id → 短 id (abs/XXXX.XXXXX)。"""
+    """entry.id → short id (abs/XXXX.XXXXX)."""
     m = re.search(r"(abs/[^/]+)$", eid)
     return m.group(1) if m else eid
 
 
 def fetch_arxiv(cats, lookback_hours, max_results):
-    """submittedDate 窗口查询 + 分页(start 每 100), 请求间隔 >=3s。"""
+    """submittedDate window query + pagination (start every 100), ≥3s between requests."""
     items = []
     since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     since_s = since.strftime("%Y%m%d%H%M")
@@ -88,7 +90,7 @@ def fetch_arxiv(cats, lookback_hours, max_results):
             try:
                 xml = http_get(url)
             except Exception as e:
-                print(f"  ⚠️ arxiv/{cat} start={start} 失败: {e}")
+                print(f"  ⚠️ arxiv/{cat} start={start} failed: {e}")
                 raise
             ns = {"a": "http://www.w3.org/2005/Atom"}
             root = ET.fromstring(xml)
@@ -108,7 +110,7 @@ def fetch_arxiv(cats, lookback_hours, max_results):
                     "publishedAt": parse_iso(e.findtext("a:published", "", ns)),
                     "text": summ,
                 })
-            print(f"  arxiv/{cat} start={start}: +{len(entries)} 条")
+            print(f"  arxiv/{cat} start={start}: +{len(entries)} items")
             if len(entries) < 100:
                 break
             start += 100
@@ -117,7 +119,7 @@ def fetch_arxiv(cats, lookback_hours, max_results):
 
 
 def rss_find(el, names):
-    """按 local-name 容错查找: RSS2 与 RDF/RSS1 命名空间通吃。"""
+    """local-name tolerant lookup: works across RSS2 and RDF/RSS1 namespaces."""
     for child in el.iter():
         if local(child.tag) in names and child.text:
             return child.text
@@ -129,7 +131,7 @@ def rss_children(el, name):
 
 
 def fetch_rss(url):
-    """RSS 2.0 / RSS 1.0(RDF) / Atom 三合一容错解析。"""
+    """Tolerant parse for RSS 2.0 / RSS 1.0 (RDF) / Atom."""
     xml = http_get(url)
     root = ET.fromstring(xml)
     items = []
@@ -160,7 +162,7 @@ def fetch_rss(url):
             link = clean_text(rss_find(e, {"link"}))
             if not title or not link:
                 continue
-            desc = rss_find(e, {"encoded", "description"})  # content:encoded 优先
+            desc = rss_find(e, {"encoded", "description"})  # content:encoded preferred
             items.append({
                 "id": link, "source": "rss", "sourceUrl": link, "title": title,
                 "author": clean_text(rss_find(e, {"creator", "author"})) or None,
@@ -172,7 +174,7 @@ def fetch_rss(url):
 
 
 def fetch_hn(query):
-    """HN Algolia search_by_date, 只看 story, 按时间倒序。"""
+    """HN Algolia search_by_date, stories only, newest first."""
     url = ("https://hn.algolia.com/api/v1/search_by_date?tags=story&hitsPerPage=50&"
            + urllib.parse.urlencode({"query": query}))
     data = json.loads(http_get(url))
@@ -212,19 +214,19 @@ def main():
             got = fn()
             items.extend(got)
             health[f"{kind}:{sid}"] = {"ok": True, "items": len(got), "secs": round(time.time() - t0, 1)}
-            print(f"✅ {kind}/{sid}: {len(got)} 条 ({time.time()-t0:.1f}s)")
+            print(f"✅ {kind}/{sid}: {len(got)} items ({time.time()-t0:.1f}s)")
         except Exception as e:
             health[f"{kind}:{sid}"] = {"ok": False, "error": str(e)[:200], "secs": round(time.time() - t0, 1)}
             print(f"❌ {kind}/{sid}: {e}")
 
-    # 同一天内按 URL 去重(跨源转载)
+    # dedupe by URL within a day (cross-source reposts)
     seen, uniq = set(), []
     for it in items:
         if it["sourceUrl"] in seen:
             continue
         seen.add(it["sourceUrl"])
         uniq.append(it)
-    print(f"抓取 {len(items)} 条 → 去重后 {len(uniq)} 条")
+    print(f"fetched {len(items)} → {len(uniq)} after dedupe")
 
     out = {"date": date, "fetchedAt": datetime.now(timezone.utc).isoformat(),
            "items": uniq, "sourceHealth": health}

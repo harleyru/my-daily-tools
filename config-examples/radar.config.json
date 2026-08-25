@@ -16,10 +16,10 @@
     {"query": "FPGA", "weight": 2}
   ],
   "keywords": {
-    "T1": ["ai agent", "science agent", "laboratory agent", "lab automation", "benchmark", "harness", "reinforcement learning", "large language model", "llm", "实验自动化"],
-    "T2": ["nitrogen vacancy", "nv center", "color center", "diamond", "odmr", "magnetomet", "quantum sensing", "hbn", "wide-field", "spin qubit", "cryogenic", "低温", "量子传感", "色心", "单光子", "自旋"],
-    "T3": ["instrument control", "experiment automation", "quantum control", "fpga", "red pitaya", "rfsoc", "time tagger", "lock-in", "awg", "microwave", "仪器控制", "量子控制", "锁相", "时标"],
-    "T4": ["ai for science", "ai4science", "scientific discovery", "materials discovery", "量子计算"]
+    "T1": ["ai agent", "science agent", "laboratory agent", "lab automation", "benchmark", "harness", "reinforcement learning", "large language model", "llm"],
+    "T2": ["nitrogen vacancy", "nv center", "color center", "diamond", "odmr", "magnetomet", "quantum sensing", "hbn", "wide-field", "spin qubit", "single photon", "cryogenic"],
+    "T3": ["instrument control", "experiment automation", "quantum control", "fpga", "red pitaya", "rfsoc", "time tagger", "lock-in", "awg", "microwave"],
+    "T4": ["ai for science", "ai4science", "scientific discovery", "materials discovery", "quantum computing"]
   },
   "maxEditorialItems": 40,
   "textTruncate": 1200,

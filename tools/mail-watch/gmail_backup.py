@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""IMAP 备份 Gmail: 全部邮件下载为 .eml,按 年/月 归档,按 Message-ID 去重。
+"""IMAP backup of Gmail: download all mail as .eml, archived by year/month, deduped by Message-ID.
 
-Gmail 特点: 同一封邮件会出现在多个标签文件夹里(如 Inbox 和 [Gmail]/All Mail)。
-策略: 先下载具体标签(Inbox/Sent/自定义标签),[Gmail]/All Mail 最后兜底,
-用 Message-ID 全局去重,保证不重复、标签信息尽量保留。
+Gmail quirk: the same message appears in multiple label folders (e.g. Inbox and
+[Gmail]/All Mail). Strategy: download concrete labels first (Inbox/Sent/custom
+labels), [Gmail]/All Mail last as a fallback, dedupe globally by Message-ID so
+nothing is duplicated and label information is kept as much as possible.
 
-用法:
-    gmail_backup.py                    # 增量备份
-    gmail_backup.py --dry-run          # 只统计不下载
-凭据: Keychain (gmail_email / gmail_app_pass)
-存档: ~/Documents/email_backup/gmail/
+Usage:
+    gmail_backup.py                    # incremental backup
+    gmail_backup.py --dry-run          # count only, no download
+Credentials: Keychain (gmail_email / gmail_app_pass)
+Archive: <EMAIL_BACKUP> (default ~/Documents/email_backup/gmail)
 """
 import argparse
 import imaplib
@@ -30,7 +31,7 @@ IMAP_HOST = "imap.gmail.com"
 
 
 def keychain(service):
-    # .env 优先(服务器 ~/daily/.env), 回退 macOS Keychain(Mac 本地)
+    # .env first (server deployments), fall back to macOS Keychain
     try:
         for line in open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"), encoding="utf-8"):
             line = line.strip()
@@ -51,7 +52,7 @@ def load_state():
             with open(STATE_FILE) as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
-            pass  # 状态文件损坏(如写入中断),当作无进度处理
+            pass  # corrupt state file (e.g. interrupted write); treat as no progress
     return {}
 
 
@@ -67,7 +68,7 @@ def safe_name(s):
 
 def msg_id(raw):
     m = re.search(rb"^Message-ID:\s*(.+)$", raw, re.M | re.I)
-    # 解码为 str,否则 bytes 无法写入 JSON 状态文件
+    # decode to str, otherwise bytes can't be written to the JSON state file
     return m.group(1).strip().lower().decode(errors="ignore") if m else None
 
 
@@ -79,20 +80,20 @@ def main():
 
     password = keychain("gmail_app_pass")
     if not args.email or not password:
-        print("❌ 缺少凭据。先运行:")
-        print("  security add-generic-password -U -a $USER -s gmail_email -w <邮箱>")
-        print("  security add-generic-password -U -a $USER -s gmail_app_pass -w <16位应用密码>")
+        print("❌ Missing credentials. Run first:")
+        print("  security add-generic-password -U -a $USER -s gmail_email -w <account>")
+        print("  security add-generic-password -U -a $USER -s gmail_app_pass -w <16-char app password>")
         sys.exit(1)
 
     M = imaplib.IMAP4_SSL(IMAP_HOST, 993)
     try:
         M.login(args.email, password)
     except imaplib.IMAP4.error as e:
-        print(f"❌ 登录失败: {e}")
-        print("   检查: 1) 应用密码是否16位 2) Gmail 设置里 IMAP 是否开启(设置→查看所有设置→转发和POP/IMAP→启用IMAP)")
+        print(f"❌ Login failed: {e}")
+        print("   Check: 1) app password is 16 chars  2) IMAP is enabled in Gmail settings")
         sys.exit(3)
-    # 连接卡住时 300 秒后报错退出(外层循环会自动重试),而不是永远挂起
-    # 批量 FETCH 响应大, 超时放宽到 5 分钟
+    # Time out after 300s instead of hanging forever (outer loop retries);
+    # large batch FETCHes need a generous timeout
     M.socket().settimeout(300)
 
     state = load_state()
@@ -100,7 +101,8 @@ def main():
     total_new = 0
     total_failed = 0
 
-    # 兜底: 上次中断时状态未存档,从已下载文件重建 Message-ID 集合,避免重复下载
+    # Fallback: state file missing (interrupted run) — rebuild the Message-ID set
+    # from already-downloaded files to avoid re-downloading
     if not state.get("_msgids"):
         eml_root = os.path.join(BACKUP_DIR, "eml")
         for dirpath, _, files in os.walk(eml_root):
@@ -116,12 +118,12 @@ def main():
                 except OSError:
                     pass
         if seen_ids:
-            print(f"从已下载文件重建 {len(seen_ids)} 个 Message-ID")
+            print(f"Rebuilt {len(seen_ids)} Message-IDs from downloaded files")
 
-    # 具体标签先下,All Mail 最后兜底;垃圾箱/已删除跳过
+    # Concrete labels first, All Mail last; skip spam/trash
     def parse_folder(line):
         line = line.decode(errors="ignore") if isinstance(line, bytes) else line
-        m = re.search(r'"([^"]*)"\s*$', line)   # 取行尾引号内的文件夹名
+        m = re.search(r'"([^"]*)"\s*$', line)   # folder name in trailing quotes
         return m.group(1) if m else line.strip()
 
     SKIP = ("[Gmail]/Spam", "[Gmail]/Bin", "[Gmail]/Trash", "Google scholar")
@@ -130,7 +132,7 @@ def main():
     folders.sort(key=lambda f: "[Gmail]/All Mail" in f)
 
     for folder in folders:
-        # 注意: 本机 imaplib 不自动给文件夹名加引号,含空格的名字必须手动加
+        # note: imaplib doesn't auto-quote folder names — names with spaces need quotes
         status, cnt = M.select(f'"{folder}"', readonly=True)
         if status != "OK":
             continue
@@ -144,8 +146,9 @@ def main():
                 raw_ids = raw_ids.decode(errors="ignore")
             new_ids = [u for u in raw_ids.split() if u not in seen_uids]
 
-        # 快速头扫描: 批量只取 Message-ID, 已在其他文件夹下过的直接跳过
-        # (否则 All Mail 等文件夹会把 3 万封再拉一遍又丢弃, 白白多跑十几个小时)
+        # Fast header scan: batch-fetch Message-IDs only; skip messages already
+        # downloaded in another folder (otherwise All Mail re-pulls 30k messages
+        # and discards them — hours wasted)
         if new_ids:
             scan = new_ids
             new_ids = []
@@ -153,7 +156,7 @@ def main():
                 batch = ",".join(scan[i:i + 500])
                 st, d = M.uid("FETCH", batch, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM)] UID)")
                 if st != "OK" or not d:
-                    new_ids.extend(scan[i:i + 500])   # 扫描失败退回直接下载, 宁慢勿漏
+                    new_ids.extend(scan[i:i + 500])   # scan failed → download directly, better slow than lossy
                     continue
                 for part in d:
                     if not isinstance(part, tuple):
@@ -165,34 +168,34 @@ def main():
                     if isinstance(body, str):
                         body = body.encode()
                     if re.search(rb"^From:.*scholaralerts", body or b"", re.M | re.I):
-                        seen_uids.add(mu.group(1).decode())   # Scholar 警报有意跳过, 记入已处理
+                        seen_uids.add(mu.group(1).decode())   # deliberately skip Scholar alerts, mark handled
                         continue
                     mid = msg_id(body or b"")
                     if mid and mid in seen_ids:
-                        seen_uids.add(mu.group(1).decode())   # 已下过, 记入已处理
+                        seen_uids.add(mu.group(1).decode())   # already downloaded, mark handled
                     else:
                         new_ids.append(mu.group(1).decode())
-            print(f"📁 {folder}: {n} 封, 头扫描 {len(scan)} → 实际需下 {len(new_ids)} 封")
+            print(f"📁 {folder}: {n} total, header scan {len(scan)} → {len(new_ids)} to fetch")
         else:
-            print(f"📁 {folder}: {n} 封, 新 {len(new_ids)} 封")
+            print(f"📁 {folder}: {n} total, {len(new_ids)} new")
         if args.dry_run:
             continue
 
-        # 批量下载: 每次 FETCH 25 封; 整批失败自动退化为单封补齐, 保证不漏
+        # Batch download: 25 per FETCH; failed batches degrade to per-message retry
         def store(uid_s, raw):
-            """写入一封邮件, 返回是否已处理(含有意跳过)。"""
+            """Write one message; returns whether it was handled (incl. deliberate skips)."""
             nonlocal total_new
             if not raw:
                 return False
             if isinstance(raw, str):
                 raw = raw.encode()
-            # 双保险: 即使通过 All Mail 兜底,Scholar 警报也过滤掉
+            # double safety: even via the All Mail fallback, filter Scholar alerts
             if re.search(rb"^From:.*scholaralerts", raw, re.M | re.I):
-                seen_uids.add(uid_s)   # 有意跳过, 记入已处理避免下轮重复拉取
+                seen_uids.add(uid_s)   # deliberate skip, mark handled to avoid re-fetching
                 return True
             mid = msg_id(raw)
             if mid and mid in seen_ids:
-                return True  # 已在别的标签下载过
+                return True  # already downloaded under another label
             try:
                 dt = parsedate_to_datetime(
                     re.search(rb"^Date:\s*(.+)$", raw, re.M | re.I).group(1).decode(errors="ignore"))
@@ -213,7 +216,7 @@ def main():
                 seen_ids.add(mid)
             seen_uids.add(uid_s)
             total_new += 1
-            # 每 100 封存档一次断点,中断/卡死重启不丢进度
+            # Checkpoint every 100 messages so an interrupted run resumes cleanly
             if total_new % 100 == 0:
                 state[folder] = sorted(seen_uids)
                 state["_msgids"] = sorted(seen_ids)
@@ -230,7 +233,7 @@ def main():
             except Exception as e:
                 status, msg = f"EXC:{type(e).__name__}", None
             if status != "OK" or not msg:
-                print(f"  ⚠️ 批量失败({status}) → 单封补齐 {len(batch)} 封")
+                print(f"  ⚠️ batch failed ({status}) → per-message retry for {len(batch)}")
             else:
                 for part in msg:
                     if not isinstance(part, tuple) or not part[0]:
@@ -242,7 +245,7 @@ def main():
                     raw = part[1]
                     if store(uid_s, raw):
                         done.add(uid_s)
-            # 该批缺失/失败的 → 单封补齐(下一轮运行前不漏)
+            # Missing/failed of this batch → per-message retry (nothing lost before the next run)
             for uid in batch:
                 if uid in done:
                     continue
@@ -255,9 +258,9 @@ def main():
                     pass
                 folder_failed += 1
         if total_new > before_folder:
-            print(f"  ✅ 本文件夹实际写入 {total_new - before_folder} 封")
+            print(f"  ✅ wrote {total_new - before_folder} new this folder")
         if folder_failed:
-            print(f"  ⚠️ 本文件夹 {folder_failed} 封单封补齐失败,下一轮重试")
+            print(f"  ⚠️ {folder_failed} failed per-message retries, retried next run")
         total_failed += folder_failed
 
         state[folder] = sorted(seen_uids)
@@ -265,9 +268,9 @@ def main():
         save_state(state)
 
     M.logout()
-    print(f"\n✅ 完成,本次新下载 {total_new} 封 → {BACKUP_DIR}/eml/")
+    print(f"\n✅ Done, {total_new} new messages → {BACKUP_DIR}/eml/")
     if total_failed:
-        print(f"⚠️ 其中 {total_failed} 封补齐失败,退出码 2 触发外层重试")
+        print(f"⚠️ {total_failed} failed retries, exit code 2 triggers outer retry")
         sys.exit(2)
 
 

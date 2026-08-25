@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""每日早清单: 当日日程快照 + 长期任务 → 飞书推送。2026-08-21 起在服务器 systemd 9:30 跑。
-日程快照由 Mac 端 scripts/sync_daily.sh 每 30 分钟导出并同步过来 (data/calendar_today.json)。"""
+"""Daily morning digest: today's calendar snapshot + long-term tasks → push via notify.sh.
+The calendar snapshot (data/calendar_today.json) is exported by the macOS sync script.
+
+Section titles below ("Today's tasks", "In progress", "Todo") are the headings of
+your markdown notes (journal/YYYY-MM-DD.md, ongoing.md) — rename to match yours.
+"""
 import re, subprocess, os, json
 from datetime import datetime, date
 
@@ -9,22 +13,25 @@ PROJ = os.environ.get("DAILY_BASE") or os.path.dirname(TOOLS)
 NOTIFY = os.path.join(TOOLS, "notify", "notify.sh")
 ONGOING = os.path.join(PROJ, "ongoing.md")
 SNAP = os.path.join(PROJ, "data", "calendar_today.json")
+NOTES_DIR = "journal"                # your daily-notes directory (日记/ in the author's setup)
+TODAY_SECTION = "## Today's tasks"   # heading of the daily note's per-day tasks section
 GMAIL_STATE = os.path.join(
     os.environ.get("EMAIL_BACKUP") or os.path.expanduser("~/Documents/email_backup/gmail"),
     ".state.json",
 )
 
-# 任务展示样式: 任务名片段 → (当前阶段, 总阶段), 状态点 ●●●○○。按你的任务填, 例:
-# STAGES = {"论文修改": (2, 4), "搭建实验": (1, 3)}
+# Task display: task-name fragment → (current stage, total stages), dots ●●●○○. Fill your own, e.g.
+# STAGES = {"paper revision": (2, 4), "experiment setup": (1, 3)}
 STAGES = {}
-GMAIL_TOTAL = 0  # 你的备份总数, 用于进度条; 0 = 不显示
+GMAIL_TOTAL = 0  # your backup total, for the progress bar; 0 = hidden
 
 PRI = {"P0": "🔴", "P1": "🟡", "P2": "⚪"}
+WEEKDAYS = "MonTueWedThuFriSatSun"
 
 
 def today_events():
-    """读 Mac 同步过来的当日日程快照, 返回 [(时间HH:MM, 日历名, 标题)] 按时间排序;
-    无快照或快照日期非今天(如 Mac 未开机同步)返回 None"""
+    """Read today's calendar snapshot (synced from macOS); returns [(HH:MM, calendar, title)]
+    sorted by time; None if the snapshot is missing or stale (macOS not synced)"""
     try:
         data = json.load(open(SNAP, encoding="utf-8"))
     except (OSError, ValueError):
@@ -36,19 +43,19 @@ def today_events():
 
 
 def ongoing_rows():
-    """解析 ongoing.md 的 进行中/待办 表格行,返回 [(任务,优先级,截止,进展,状态)]"""
+    """Parse the "In progress"/"Todo" table rows of ongoing.md; returns [(task, pri, due, progress, icon)]"""
     rows = []
     section = None
     for line in open(ONGOING, encoding="utf-8"):
         line = line.rstrip()
         if line.startswith("## "):
             section = line[3:]
-        if not line.startswith("|") or section not in ("🚧 进行中", "🗓 待办"):
+        if not line.startswith("|") or section not in ("In progress", "Todo"):
             continue
         cells = [c.strip() for c in line.strip("|").split("|")]
-        if len(cells) < 5 or cells[0] in ("任务", "------"):
+        if len(cells) < 5 or cells[0] in ("task", "Task", "------"):
             continue
-        rows.append((cells[0], cells[1], cells[2], cells[3], "🚧" if section == "🚧 进行中" else "🗓"))
+        rows.append((cells[0], cells[1], cells[2], cells[3], "🚧" if section == "In progress" else "🗓"))
     return rows
 
 
@@ -66,8 +73,8 @@ def bar(cur, total, width=16):
 
 
 def today_journal_tasks():
-    """读当日日记的「今日任务」未勾选项, 返回列表(去掉复选框与加粗标记)"""
-    diary = os.path.join(PROJ, "日记", date.today().strftime("%Y-%m-%d") + ".md")
+    """Read today's daily note for unchecked per-day tasks (checkbox + bold stripped)"""
+    diary = os.path.join(PROJ, NOTES_DIR, date.today().strftime("%Y-%m-%d") + ".md")
     items = []
     if not os.path.exists(diary):
         return items
@@ -75,7 +82,7 @@ def today_journal_tasks():
     for line in open(diary, encoding="utf-8"):
         line = line.rstrip()
         if line.startswith("## "):
-            section = line.startswith("## 今日任务")
+            section = line.startswith(TODAY_SECTION)
             continue
         if section and line.startswith("- [ ]"):
             items.append(re.sub(r"\*+", "", line[6:]).strip())
@@ -92,27 +99,27 @@ def gmail_count():
 
 def main():
     now = datetime.now()
-    lines = [f"☀️ 早清单 {now.strftime('%m-%d')}（{'一二三四五六日'[now.weekday()]}）"]
+    lines = [f"☀️ Daily digest {now.strftime('%m-%d')} ({WEEKDAYS[now.weekday() * 3:now.weekday() * 3 + 3]})"]
 
     evs = today_events()
-    lines.append("\n📅 今日日程")
+    lines.append("\n📅 Today's schedule")
     if evs:
         for hhmm, cal, title in evs:
-            tag = "" if cal == "Agent" else f"（{cal}）"
+            tag = "" if cal == "Agent" else f"({cal})"
             lines.append(f"▸ {hhmm} {title}{tag}")
     elif evs is None:
-        lines.append("▸ 无日程快照（Mac 未同步，当天日程可能缺失）")
+        lines.append("▸ No schedule snapshot (macOS not synced; today's events may be missing)")
     else:
-        lines.append("▸ 无日程安排")
+        lines.append("▸ No events today")
 
-    lines.append("\n📋 今日任务")
+    lines.append("\n📋 Today's tasks")
     tts = today_journal_tasks()
     if tts:
         lines.extend(f"▸ {t}" for t in tts)
     else:
-        lines.append("▸ 无(未在日记里细化今日任务)")
+        lines.append("▸ None (no per-day tasks listed in the daily note)")
 
-    lines.append("\n🔥 长期任务")
+    lines.append("\n🔥 Long-term tasks")
     soon = []
     for task, pri, due, prog, icon in ongoing_rows():
         badge = PRI.get(pri, "⚪")
@@ -121,15 +128,15 @@ def main():
         dstr = dm.group(0)[5:] if dm else None
         head = f"{badge} {task}"
         if dl is not None:
-            head += f" | ⏳{dstr} 剩{dl}天" if dl <= 7 else f" | {dstr}"
+            head += f" | ⏳{dstr} {dl}d left" if dl <= 7 else f" | {dstr}"
         lines.append(head)
 
-        # Gmail 特殊: 真实进度条(设 GMAIL_TOTAL > 0 启用)
+        # Gmail special: real progress bar (enable with GMAIL_TOTAL > 0)
         if "Gmail" in task and GMAIL_TOTAL > 0:
             cnt = gmail_count()
             lines.append(f"  └ {bar(cnt, GMAIL_TOTAL)} {cnt}/{GMAIL_TOTAL}")
             continue
-        # 其余: 状态点
+        # Others: stage dots
         st = next(((a, b) for k, (a, b) in STAGES.items() if k in task), None)
         if st:
             dots = "●" * st[0] + "○" * (st[1] - st[0])
@@ -137,10 +144,10 @@ def main():
         else:
             lines.append(f"  └ {prog}")
         if dl is not None and 0 <= dl <= 7:
-            soon.append(f"{task}（{due}）")
+            soon.append(f"{task} ({due})")
 
     if soon:
-        lines.append("\n⏰ 7 天内到期")
+        lines.append("\n⏰ Due within 7 days")
         lines.extend(f"▸ {s}" for s in soon)
 
     subprocess.run([NOTIFY, "\n".join(lines)])

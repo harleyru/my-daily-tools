@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""新邮件审查(2026-08-16 起, 用户拍板):
-「广告促销」→ 自动归档: Gmail 移除 \\Inbox 标签(邮件保留 All Mail 可搜可恢复), 本地 eml 照存, 不再人工审查。
-「发件人白名单」(AUTO_ARCHIVE_SENDERS 域名匹配, 2026-08-18 起: Academia Mentions) → 同样直接归档; 失败记审计留收件箱。
-「直接删除白名单」(AUTO_DELETE_SENDERS 域名匹配, 2026-08-20 起: Spotify) → 直接删除(移入 Gmail 回收站, 30天可恢复; 本地 eml 保留); 失败记审计留收件箱。
-「购物」(订单/发票类可能有用) → 记入待定清单 → 推飞书 → 用户判断删/留。
+"""New-mail review (reference implementation):
+「Promotions」category → auto-archive: remove the \\Inbox label in Gmail (mail stays in
+All Mail, searchable and recoverable), local .eml kept, no manual review.
+Sender allow-list (AUTO_ARCHIVE_SENDERS, domain match) → archived the same way;
+failures are logged to the audit and left in the inbox.
+Sender delete-list (AUTO_DELETE_SENDERS, domain match) → deleted (Gmail trash,
+recoverable for 30 days; local .eml kept); failures logged, left in the inbox.
+「Shopping」category (orders/invoices may be useful) → pending queue + push → keep/delete decision.
 
-由 mail_watch.py 每 30 分钟调 --scan。用户在会话里说"删 #3 #5"/"广告全删"/"留 #2",我跑 --delete/--keep。
-删除方式: 按 Message-ID 在 All Mail 精确搜索 → \\Deleted + EXPUNGE → Gmail 回收站(30天可恢复)。
-本地 eml 保留归档(与既往清理策略一致: 只删 Gmail 端, 本地备份不删)。
-归档审计: data/mail_ad_archived.json(最多留 500 条)。
+Called from mail_watch.py every 30 min with --scan. Say "delete #3 #5" / "delete all" /
+"keep #2" in a Claude session to run --delete / --keep.
+Delete: exact Message-ID search in All Mail → \\Deleted + EXPUNGE → Gmail trash (30 days recoverable).
+Local .eml always kept (only the Gmail side is deleted).
+Audit: data/mail_ad_archived.json (capped at 500 entries).
 
-用法:
-    python3 mail_ad_review.py --scan            # 扫描新邮件: 促销自动归档, 购物/归档失败记入清单并推飞书
-    python3 mail_ad_review.py --seed            # 只初始化状态(历史邮件不当作新邮件)
-    python3 mail_ad_review.py --list            # 打印待定清单
-    python3 mail_ad_review.py --delete 3,5      # 删除指定编号(→ Gmail 回收站)
-    python3 mail_ad_review.py --delete-all      # 删除全部待定
-    python3 mail_ad_review.py --keep 2,4        # 保留指定编号(不再提示)
+Usage:
+    python3 mail_ad_review.py --scan            # scan new mail: promotions auto-archive, shopping/failures → queue + push
+    python3 mail_ad_review.py --seed            # initialize state only (historical mail not treated as new)
+    python3 mail_ad_review.py --list            # print the pending queue
+    python3 mail_ad_review.py --delete 3,5      # delete the given ids (→ Gmail trash)
+    python3 mail_ad_review.py --delete-all      # delete all pending
+    python3 mail_ad_review.py --keep 2,4        # keep the given ids (never prompt again)
 """
 import imaplib, json, os, re, subprocess, sys, time
 from email import policy
@@ -31,18 +35,20 @@ PENDING = os.path.join(BASE, "data", "mail_ad_pending.json")
 ARCHIVED = os.path.join(BASE, "data", "mail_ad_archived.json")
 NOTIFY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notify", "notify.sh")
 
-# 参与待定审查的分类目录(示例: 广告促销/购物; 按你的 Gmail 分类结构改)
-AD_DIRS = ("广告促销", "购物")
+# eml folder names whose new mail is auto-archived (promotional — no review needed).
+# These come from your category tree (see mail_categories.py) — match to your own.
+AUTO_ARCHIVE_DIRS = ("Promotions",)
+# eml folder names whose new mail goes to the pending queue for a keep/delete decision
+PENDING_DIRS = ("Shopping",)
 
-# 发件人白名单(按域名匹配): 命中 → 直接归档, 无需审查。示例: ("your-sender.com",)
+# Sender allow-list (domain match): hit → auto-archive, no review. Example: ("your-sender.com",)
 AUTO_ARCHIVE_SENDERS = ()
+# Sender delete-list (domain match): hit → Gmail trash (30 days recoverable), local .eml kept
 AUTO_DELETE_SENDERS = ()
-
-# 直接删除白名单: 用户指定「直接删除」的发件人(按域名匹配, 2026-08-20 起: Spotify) → 移入 Gmail 回收站(30天可恢复), 本地 eml 保留
 
 
 def keychain(service):
-    # .env 优先(服务器 ~/daily/.env), 回退 macOS Keychain(Mac 本地)
+    # .env first (server deployments), fall back to macOS Keychain
     try:
         for line in open(os.path.join(BASE, ".env"), encoding="utf-8"):
             line = line.strip()
@@ -107,8 +113,8 @@ def save_archived(p):
 
 
 def gmail_archive_one(M, path):
-    """按 Message-ID 在 All Mail 精确搜索 → 移除 \\Inbox 标签(归档, 邮件仍在 All Mail)。
-    返回 'archived' | 'notfound'(All Mail 未见, 视为已处理) | 'error'"""
+    """Exact Message-ID search in All Mail → remove the \\Inbox label (archive; mail stays in All Mail).
+    Returns 'archived' | 'notfound' (not in All Mail, treat as handled) | 'error'"""
     try:
         msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
         mid = (msg["Message-ID"] or "").strip().strip("<>")
@@ -126,7 +132,7 @@ def gmail_archive_one(M, path):
 
 
 def sender_auto_match(path):
-    """发件人白名单判定: From 域名命中 AUTO_ARCHIVE_SENDERS → 直接归档"""
+    """Allow-list check: From domain hits AUTO_ARCHIVE_SENDERS → archive directly"""
     try:
         msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
         _, addr = parseaddr(hdr(msg["From"] or ""))
@@ -136,7 +142,7 @@ def sender_auto_match(path):
 
 
 def sender_delete_match(path):
-    """直接删除白名单判定: From 域名命中 AUTO_DELETE_SENDERS → 直接删除"""
+    """Delete-list check: From domain hits AUTO_DELETE_SENDERS → delete directly"""
     try:
         msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
         _, addr = parseaddr(hdr(msg["From"] or ""))
@@ -146,8 +152,8 @@ def sender_delete_match(path):
 
 
 def gmail_delete_one(M, path):
-    """按 Message-ID 在 All Mail 精确搜索 → \\Deleted + EXPUNGE → Gmail 回收站(30天可恢复)。
-    返回 'deleted' | 'notfound'(All Mail 未见, 视为已处理) | 'error'"""
+    """Exact Message-ID search in All Mail → \\Deleted + EXPUNGE → Gmail trash (30 days recoverable).
+    Returns 'deleted' | 'notfound' (not in All Mail, treat as handled) | 'error'"""
     try:
         msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
         mid = (msg["Message-ID"] or "").strip().strip("<>")
@@ -178,11 +184,12 @@ def scan():
                 fresh.append(p)
     save_state({"last_scan": now})
     if not fresh:
-        print("无新邮件")
+        print("no new mail")
         return
 
-    promo = [p for p in fresh if os.path.sep + "广告促销" + os.path.sep in p]
-    shop = [p for p in fresh if os.path.sep + "购物" + os.path.sep in p]
+    in_dir = lambda dirs: [p for p in fresh if any(os.path.sep + d + os.path.sep in p for d in dirs)]
+    promo = in_dir(AUTO_ARCHIVE_DIRS)
+    shop = in_dir(PENDING_DIRS)
     auto_send = [p for p in fresh if p not in promo + shop and sender_auto_match(p)]
     auto_del = [p for p in fresh if p not in promo + shop + auto_send and sender_delete_match(p)]
 
@@ -193,9 +200,10 @@ def scan():
     n_send = 0
     n_del = 0
 
-    # 广告促销 + 发件人白名单 → 自动归档(移除收件箱标签, All Mail 可搜可恢复, 本地 eml 照存);
-    # 直接删除白名单 → 移入回收站(30天可恢复), 本地 eml 保留;
-    # 促销归档失败/IMAP 连接失败 → 转入待定审查, 不静默丢; 白名单(归档/删除)失败则记审计留收件箱
+    # Promotions + allow-list senders → auto-archive (remove inbox label, All Mail searchable,
+    # local .eml kept); delete-list senders → trash (30 days recoverable), local .eml kept;
+    # archive failures / IMAP failures → pending review, never silently dropped;
+    # allow/delete-list failures are logged to the audit and left in the inbox
     if promo or auto_send or auto_del:
         M = None
         try:
@@ -205,10 +213,10 @@ def scan():
             st, _ = M.select('"[Gmail]/All Mail"', readonly=False)
             if st != "OK":
                 M = None
-                print("无法打开 All Mail, 促销邮件转待定审查")
+                print("cannot open All Mail, promotions → pending review")
         except Exception as e:
             M = None
-            print(f"IMAP 连接失败({e}), 促销邮件转待定审查")
+            print(f"IMAP connect failed ({e}), promotions → pending review")
         alog = load_archived()
         for path in sorted(promo, key=os.path.getmtime):
             try:
@@ -224,11 +232,11 @@ def scan():
                                   "at": time.strftime("%F %T")})
             if result == "archived":
                 n_archived += 1
-                print(f"🗂 已归档: {subj[:40]}")
+                print(f"🗂 archived: {subj[:40]}")
             elif result == "notfound":
-                print(f"🗂 All Mail 未见(可能已归档/删除): {subj[:40]}")
+                print(f"🗂 not in All Mail (maybe already archived/deleted): {subj[:40]}")
             else:
-                print(f"⚠ 归档失败转待定: {subj[:40]}")
+                print(f"⚠ archive failed → pending: {subj[:40]}")
                 it = {"id": next_id, "sender": addr or frm[:60], "subject": subj,
                       "path": path, "status": "pending", "added": time.strftime("%F %T")}
                 p["items"].append(it)
@@ -248,9 +256,9 @@ def scan():
                                   "at": time.strftime("%F %T")})
             if result == "archived":
                 n_send += 1
-                print(f"🗂 发件人白名单归档: {subj[:40]}")
+                print(f"🗂 allow-list archived: {subj[:40]}")
             else:
-                print(f"⚠ 发件人白名单归档失败(留收件箱, 已记审计): {subj[:40]}")
+                print(f"⚠ allow-list archive failed (left in inbox, audited): {subj[:40]}")
         for path in sorted(auto_del, key=os.path.getmtime):
             try:
                 msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
@@ -265,12 +273,12 @@ def scan():
                                   "at": time.strftime("%F %T")})
             if result == "deleted":
                 n_del += 1
-                print(f"🗑️ 发件人白名单删除(回收站): {subj[:40]}")
+                print(f"🗑️ delete-list removed (trash): {subj[:40]}")
             elif result == "notfound":
-                print(f"🗑️ All Mail 未见(可能已删除): {subj[:40]}")
+                print(f"🗑️ not in All Mail (maybe already deleted): {subj[:40]}")
             else:
-                print(f"⚠ 发件人白名单删除失败(留收件箱, 已记审计): {subj[:40]}")
-        alog["items"] = alog["items"][-500:]  # 审计日志封顶
+                print(f"⚠ delete-list removal failed (left in inbox, audited): {subj[:40]}")
+        alog["items"] = alog["items"][-500:]  # cap the audit log
         save_archived(alog)
         if M is not None:
             try:
@@ -278,7 +286,7 @@ def scan():
             except Exception:
                 pass
 
-    # 购物(订单/发票类可能有用) → 仍走待定审查
+    # Shopping (orders/invoices may be useful) → pending queue
     for path in sorted(shop, key=os.path.getmtime):
         try:
             msg = email.message_from_bytes(open(path, "rb").read(), policy=policy.default)
@@ -295,33 +303,33 @@ def scan():
     save_pending(p)
 
     if not new_items:
-        print(f"促销归档 {n_archived} 封, 发件人白名单归档 {n_send} 封, 直接删除 {n_del} 封, 无待定新邮件")
+        print(f"archived {n_archived} promotions, {n_send} allow-list, deleted {n_del} direct — no new pending mail")
         return
     n = len(new_items)
-    print(f"新购物邮件 {n} 封, 已记入待定清单; 促销归档 {n_archived} 封, 发件人白名单归档 {n_send} 封, 直接删除 {n_del} 封")
-    lines = ["🗑️ 新邮件待定(购物/归档失败)"]
+    print(f"new mail pending {n}; archived {n_archived} promotions, {n_send} allow-list, deleted {n_del} direct")
+    lines = ["🗑️ New mail pending (shopping/archive failures)"]
     for it in new_items[:8]:
         lines.append(f"#{it['id']} {it['sender'][:32]} | {it['subject'][:40]}")
     if n > 8:
-        lines.append(f"… 还有 {n - 8} 封")
+        lines.append(f"… {n - 8} more")
     if n_archived:
-        lines.append(f"🗂 另自动归档促销广告 {n_archived} 封(All Mail 可恢复, 本地 eml 保留)")
+        lines.append(f"🗂 auto-archived {n_archived} promotional messages (recoverable in All Mail, local .eml kept)")
     if n_send:
-        lines.append(f"🗂 发件人白名单归档 {n_send} 封(Academia Mentions 等, 可直接归档)")
+        lines.append(f"🗂 allow-list archived {n_send} messages (domain allow-list, no review)")
     if n_del:
-        lines.append(f"🗑️ 直接删除 {n_del} 封(Spotify 等, 回收站 30 天可恢复)")
-    lines.append("要删在 Claude 会话里说编号或'广告全删', 不回应则保留")
+        lines.append(f"🗑️ deleted {n_del} messages (trash, 30 days recoverable)")
+    lines.append("say the numbers or 'delete all' in a Claude session; no reply = keep")
     subprocess.run([NOTIFY, "\n".join(lines)])
 
 
 def gmail_delete(items):
-    """按 Message-ID 在 All Mail 精确搜索并移入回收站。返回 (deleted, skipped)。"""
+    """Exact Message-ID search in All Mail and move to trash. Returns (deleted, skipped)."""
     M = imaplib.IMAP4_SSL("imap.gmail.com", 993)
     M.login(keychain("gmail_email"), keychain("gmail_app_pass"))
     M.socket().settimeout(120)
     st, _ = M.select('"[Gmail]/All Mail"', readonly=False)
     if st != "OK":
-        raise RuntimeError("无法打开 All Mail")
+        raise RuntimeError("cannot open All Mail")
     deleted, skipped = [], []
     for it in items:
         try:
@@ -331,7 +339,7 @@ def gmail_delete(items):
             skipped.append(it)
             continue
         if not mid:
-            print(f"#{it['id']} 无 Message-ID, 跳过(需人工处理)")
+            print(f"#{it['id']} no Message-ID, skipped (manual handling needed)")
             skipped.append(it)
             continue
         q = mid.replace('"', "").replace("\\", "")
@@ -343,21 +351,21 @@ def gmail_delete(items):
         except imaplib.IMAP4.error:
             pass
         if not uids:
-            print(f"#{it['id']} 未在 All Mail 找到(可能已删), 记跳过")
+            print(f"#{it['id']} not found in All Mail (maybe already deleted), skipped")
             skipped.append(it)
             continue
         try:
             st3, _ = M.uid("STORE", ",".join(uids), "+FLAGS (\\Deleted)")
             st4, _ = M.uid("EXPUNGE", ",".join(uids))
         except (imaplib.IMAP4.abort, imaplib.IMAP4.error, OSError):
-            print(f"#{it['id']} 删除出错, 记跳过")
+            print(f"#{it['id']} delete error, skipped")
             skipped.append(it)
             continue
         if st3 == "OK":
-            print(f"#{it['id']} ✅ 已移入回收站")
+            print(f"#{it['id']} ✅ moved to trash")
             deleted.append(it)
         else:
-            print(f"#{it['id']} STORE 失败, 记跳过")
+            print(f"#{it['id']} STORE failed, skipped")
             skipped.append(it)
     try:
         M.logout()
@@ -372,7 +380,7 @@ def main():
         save_state({"last_scan": time.time()})
         if not os.path.exists(PENDING):
             save_pending({"items": []})
-        print("已初始化: 历史广告邮件不当作新邮件")
+        print("initialized: historical mail not treated as new")
         return
 
     if "--scan" in argv:
@@ -383,7 +391,7 @@ def main():
         p = load_pending()
         pend = [it for it in p["items"] if it["status"] == "pending"]
         if not pend:
-            print("待定清单为空")
+            print("pending queue is empty")
             return
         for it in pend:
             print(f"#{it['id']} [{it['status']}] {it['sender'][:40]} | {it['subject'][:50]} ({it['added']})")
@@ -402,7 +410,7 @@ def main():
         for it in p["items"]:
             if it["id"] in ids and it["status"] == "pending":
                 it["status"] = "kept"
-                print(f"#{it['id']} 已保留")
+                print(f"#{it['id']} kept")
         save_pending(p)
         return
     else:
@@ -411,7 +419,7 @@ def main():
 
     targets = [it for it in p["items"] if it["id"] in ids and it["status"] == "pending"]
     if not targets:
-        print("没有待定编号(可能已处理或编号不存在)")
+        print("no matching pending ids (already handled or don't exist)")
         return
     deleted, skipped = gmail_delete(targets)
     for it in deleted:
@@ -420,7 +428,7 @@ def main():
     for it in skipped:
         it["status"] = "skipped"
     save_pending(p)
-    print(f"完成: 删除 {len(deleted)} 封 → Gmail 回收站(30天可恢复), 本地 eml 保留归档; 跳过 {len(skipped)} 封")
+    print(f"done: deleted {len(deleted)} → Gmail trash (30 days recoverable), local .eml kept; skipped {len(skipped)}")
 
 
 if __name__ == "__main__":

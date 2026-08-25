@@ -1,8 +1,7 @@
 #!/bin/bash
-# 通过飞书 Lark 自定义机器人发送提醒, 并镜像一份到 Discord(2026-08-16 起, 用户要求全量 copy,
-# 观察后再决定删飞书哪些; 设 DAILY_NO_DISCORD=1 可跳过镜像)
-# 用法: notify.sh "消息内容" [-u]     # -u = 紧急提醒
-# 凭据: .env 优先(服务器 ~/daily/.env), 回退 Keychain (lark_webhook / lark_keyword)
+# Send a reminder via a Lark (Feishu) custom bot and mirror it to Discord.
+# Usage: notify.sh "message" [-u]     # -u = urgent (🔔 prefix)
+# Credentials: .env first (project root), fall back to macOS Keychain (lark_webhook / lark_keyword)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../.env"
@@ -15,27 +14,28 @@ KEYWORD=$(get_env lark_keyword)
 [ -z "$KEYWORD" ] && KEYWORD=$(security find-generic-password -s lark_keyword -w 2>/dev/null)
 
 if [ -z "$HOOK" ] || [ -z "$1" ]; then
-    echo "用法: notify.sh \"消息\" [-u]" >&2
+    echo "Usage: notify.sh \"message\" [-u]" >&2
     exit 1
 fi
 
 TEXT="${KEYWORD} "
-[ "$2" = "-u" ] && TEXT+="🔔 紧急提醒: "
+[ "$2" = "-u" ] && TEXT+="🔔 Urgent: "
 TEXT+="$1"
 
 RESP=$(curl -s -X POST "$HOOK" \
     -H "Content-Type: application/json" \
     -d "{\"msg_type\":\"text\",\"content\":{\"text\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$TEXT")}}")
 
-echo "$RESP" | grep -q '"code":0' && echo "✅ 飞书已发送" || echo "❌ 飞书发送失败: $RESP"
+echo "$RESP" | grep -q '"code":0' && echo "✅ Lark sent" || echo "❌ Lark failed: $RESP"
 
-# Discord 镜像: 发原文(不含飞书关键词前缀); 飞书失败也照发(相当于兜底渠道), 失败不影响飞书
+# Discord mirror: original text (without the Lark keyword prefix); sent even if Lark failed
+# (acts as a fallback channel); a Discord failure never affects Lark
 if [ -z "$DAILY_NO_DISCORD" ]; then
     DISCORD_TEXT="$1"
-    [ "$2" = "-u" ] && DISCORD_TEXT="🔔 紧急提醒: $1"
+    [ "$2" = "-u" ] && DISCORD_TEXT="🔔 Urgent: $1"
     DISCORD_OUT=$("$SCRIPT_DIR/../discord-bridge/discord_tasks.py" --post "$DISCORD_TEXT" 2>&1)
     case "$DISCORD_OUT" in
-        *"已回帖"*) echo "✅ Discord 已镜像" ;;
-        *) echo "⚠ Discord 镜像失败: $DISCORD_OUT" >&2 ;;
+        *"posted"*) echo "✅ Discord mirrored" ;;
+        *) echo "⚠ Discord mirror failed: $DISCORD_OUT" >&2 ;;
     esac
 fi
