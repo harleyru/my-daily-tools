@@ -19,7 +19,7 @@ These are the tools I run for my own daily workflow. They are published as-is be
 ## Install
 
 ```bash
-git clone https://github.com/harleyru/claude-code-skills.git
+git clone https://github.com/harleyru/my-daily-tools.git
 ln -s "$PWD/claude-code-skills/tools/"* ~/.claude/skills/   # new sessions pick them up
 ```
 
@@ -58,7 +58,7 @@ config-examples/         — config templates (copy to data/, which is gitignore
 - `calendar` uses the calendar named "Agent" — edit `add_event.scpt` to your own calendar name.
 - `mail-watch`'s `IMPORTANT_SENDERS` and `mail-ad-review`'s `AUTO_ARCHIVE_SENDERS` are personal rules — replace with your own.
 - `mail_ntu_move.py` is a reference implementation for routing forwarded mail from an institutional mailbox into a folder; adjust the domain/label to your own setup.
-- `radar`'s editorial stage shells out to the `claude` CLI headlessly (`claude -p`) — point `RADAR_EDITOR` at any Anthropic-compatible CLI if you prefer.
+- `radar`'s editorial stage and `discord-bridge`'s answer tiers shell out to an LLM CLI headlessly — point `RADAR_EDITOR` (radar) or `CLAUDE_CLI` (discord-bridge) at any Anthropic-compatible CLI; both fall back to `claude`.
 - The `discord-bridge` auto-execution tier only grants read-only web tools to the LLM agent; mutating host actions are queued to the human session by contract (`need_session`).
 
 ## License

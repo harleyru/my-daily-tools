@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """研究雷达每日编排: fetch → prefilter → editorial(claude -p) → 合同校验 → 静态站点 → 飞书推送
 
-由 launchd 每天调用一次。日志走 stdout(重定向到 ~/Library/Logs/daily/radar.log)。
-编辑台用 claude -p 无头模式(用户订阅额度), 输出按 frozen v1 合同校验, 违规自动重试一次。
+由调度器每天调用一次。日志走 stdout(自行重定向到日志文件)。
+编辑台用 claude -p 无头模式, 输出按 frozen v1 合同校验, 违规自动重试一次。
 用法: python3 radar_daily.py [YYYY-MM-DD] [--skip-fetch] [--skip-editorial] [--skip-notify]
 """
 import glob
@@ -145,10 +145,8 @@ def validate_ledger(led):
 
 
 def find_claude():
-    # 2026-08-21: 优先 claude-ds (DeepSeek 直连, ~/.local/bin/claude-ds), 回退 claude (订阅)
-    p = shutil.which("claude-ds") or os.path.expanduser("~/.local/bin/claude-ds")
-    if not os.path.exists(p):
-        p = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    # 优先 RADAR_EDITOR 环境变量(任意 Anthropic 兼容 CLI), 回退 claude
+    p = os.environ.get("RADAR_EDITOR") or shutil.which("claude")
     return p if os.path.exists(p) else None
 
 

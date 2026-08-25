@@ -14,21 +14,10 @@ GMAIL_STATE = os.path.join(
     ".state.json",
 )
 
-# 任务展示样式: 任务名片段 → (当前阶段, 总阶段), 状态点 ●●●○○
-STAGES = {
-    "RF analyzer 论文": (3, 4),
-    "wide-field": (1, 3),
-    "hBN": (1, 2),
-    "NV 小型化": (2, 4),
-    "DSO": (2, 3),
-    "真空腔+冷台": (1, 3),
-    "BP FPGA": (0, 3),
-    "gauge_rpl": (4, 8),
-    "电流芯片": (3, 3),
-    "magnetometer": (0, 2),
-    "Zitong": (0, 1),
-}
-GMAIL_TOTAL = 25497  # Gmail 实际应下总数(全量减去有意跳过的 Scholar 警报)
+# 任务展示样式: 任务名片段 → (当前阶段, 总阶段), 状态点 ●●●○○。按你的任务填, 例:
+# STAGES = {"论文修改": (2, 4), "搭建实验": (1, 3)}
+STAGES = {}
+GMAIL_TOTAL = 0  # 你的备份总数, 用于进度条; 0 = 不显示
 
 PRI = {"P0": "🔴", "P1": "🟡", "P2": "⚪"}
 
@@ -135,8 +124,8 @@ def main():
             head += f" | ⏳{dstr} 剩{dl}天" if dl <= 7 else f" | {dstr}"
         lines.append(head)
 
-        # Gmail 特殊: 真实进度条
-        if "Gmail" in task:
+        # Gmail 特殊: 真实进度条(设 GMAIL_TOTAL > 0 启用)
+        if "Gmail" in task and GMAIL_TOTAL > 0:
             cnt = gmail_count()
             lines.append(f"  └ {bar(cnt, GMAIL_TOTAL)} {cnt}/{GMAIL_TOTAL}")
             continue

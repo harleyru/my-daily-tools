@@ -321,9 +321,7 @@ def schedule_reply(content=""):
 def auto_answer(content):
     """自动问答档(纯知识, 无工具): 无头 claude -p 直接回答, 返回 (ok, text)。
     不带 --allowedTools——无审批 shell 面被分类器否决, 动手任务走会话/入池。"""
-    claude = shutil.which("claude-ds") or os.path.expanduser("~/.local/bin/claude-ds")
-    if not os.path.exists(claude):
-        claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
     if not claude or not os.path.exists(claude):
         return False, "❌ 找不到 claude CLI"
     cfg = load(CONFIG, {})
@@ -358,9 +356,7 @@ def auto_task(content):
     """自动执行档(只读工具, 2026-08-16 用户显式授权): WebSearch/WebFetch 联网调研,
     返回 (ok, need_session, answer)。不涉本机修改的任务直接完成; 需改本机(文件/日历/程序)
     的由模型按合同返回 need_session=true → 入池走会话。无 Bash/Write/Edit——安全由构造保证。"""
-    claude = shutil.which("claude-ds") or os.path.expanduser("~/.local/bin/claude-ds")
-    if not os.path.exists(claude):
-        claude = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
     if not claude or not os.path.exists(claude):
         return False, False, "❌ 找不到 claude CLI"
     prompt = (
