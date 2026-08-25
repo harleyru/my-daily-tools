@@ -1,0 +1,12 @@
+# Runtime state (scripts write here at runtime)
+data/
+*.sqlite
+
+# Credentials — never commit
+.env
+.env.*
+
+# Python / macOS junk
+__pycache__/
+*.pyc
+.DS_Store

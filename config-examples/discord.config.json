@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to data/discord/config.json. channel_id: the channel the bot watches; role_ids: roles whose @-mentions trigger the bridge; auto_exec: allow the read-only auto-execution tier.",
+  "channel_id": "",
+  "role_ids": [],
+  "auto_exec": true,
+  "auto_model": ""
+}

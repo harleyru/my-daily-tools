@@ -1,0 +1,27 @@
+{
+  "_comment": "Copy to data/radar/config.json and edit. keywords.T1..T5 define your interest tracks — recall-first prefilter, ~75% hit rate is expected; the editorial stage re-ranks.",
+  "arxiv": {
+    "categories": ["cond-mat.mes-hall", "quant-ph", "physics.ins-det", "physics.app-ph", "cond-mat.super-con"],
+    "lookbackHours": 96,
+    "maxResults": 300
+  },
+  "rss": [
+    {"id": "nature-physics", "url": "https://www.nature.com/nphys.rss", "weight": 2},
+    {"id": "nature-photonics", "url": "https://www.nature.com/nphoton.rss", "weight": 2},
+    {"id": "npj-quantum-information", "url": "https://www.nature.com/npjqi.rss", "weight": 2},
+    {"id": "quanta-physics", "url": "https://www.quantamagazine.org/physics/feed/", "weight": 1}
+  ],
+  "hn": [
+    {"query": "quantum sensing", "weight": 2},
+    {"query": "FPGA", "weight": 2}
+  ],
+  "keywords": {
+    "T1": ["ai agent", "science agent", "laboratory agent", "lab automation", "benchmark", "harness", "reinforcement learning", "large language model", "llm", "实验自动化"],
+    "T2": ["nitrogen vacancy", "nv center", "color center", "diamond", "odmr", "magnetomet", "quantum sensing", "hbn", "wide-field", "spin qubit", "cryogenic", "低温", "量子传感", "色心", "单光子", "自旋"],
+    "T3": ["instrument control", "experiment automation", "quantum control", "fpga", "red pitaya", "rfsoc", "time tagger", "lock-in", "awg", "microwave", "仪器控制", "量子控制", "锁相", "时标"],
+    "T4": ["ai for science", "ai4science", "scientific discovery", "materials discovery", "量子计算"]
+  },
+  "maxEditorialItems": 40,
+  "textTruncate": 1200,
+  "siteDays": 7
+}
