@@ -147,9 +147,23 @@ def validate_ledger(led):
 
 
 def find_claude():
-    # RADAR_EDITOR env var first (any Anthropic-compatible CLI), fall back to claude
-    p = os.environ.get("RADAR_EDITOR") or shutil.which("claude")
-    return p if os.path.exists(p) else None
+    """Resolve the editorial CLI: RADAR_EDITOR first (point it at any
+    Anthropic-compatible CLI wrapper, e.g. one that routes to another provider),
+    then plain `claude`.
+
+    Every candidate goes through shutil.which first -- RADAR_EDITOR is commonly a
+    bare command name, and a plain os.path.exists() on that would fail even when
+    the command is on PATH. The ~/.local/bin fallback covers schedulers that run
+    with a narrow PATH.
+    """
+    for cand in (os.environ.get("RADAR_EDITOR"), "claude"):
+        if not cand:
+            continue
+        p = shutil.which(cand) or os.path.expanduser(
+            "~/.local/bin/" + os.path.basename(cand))
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def run_editorial(date, candidates, meta):
@@ -210,7 +224,28 @@ def _parse_result(stdout):
         return json.loads(raw)
     except json.JSONDecodeError as e:
         print(f"  JSON parse failed: {e}")
+        _dump_bad_output(raw, e)
         return None
+
+
+def _dump_bad_output(raw, err):
+    """On a parse failure, persist the raw output so the cause can be diagnosed
+    afterwards -- the terminal log alone is not enough to fix a prompt or a model
+    that has started emitting prose around the JSON."""
+    try:
+        d = os.path.join(BASE, "logs")
+        os.makedirs(d, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        p = os.path.join(d, f"radar_editorial_fail_{ts}.txt")
+        pos = getattr(err, "pos", None)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(f"# {err}\n# len={len(raw)} pos={pos}\n")
+            if pos is not None:
+                f.write(f"# context around the error: ...{raw[max(0, pos - 200):pos + 200]}...\n")
+            f.write("\n" + raw)
+        print(f"  raw output saved to {p}")
+    except Exception as ex:
+        print(f"  (could not save raw output: {ex})")
 
 
 def build_site():
@@ -300,6 +335,10 @@ def esc(s):
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+def _clip(s, n):
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def notify(date, day):
     cards = day.get("cards", [])
     if not cards:
@@ -310,7 +349,12 @@ def notify(date, day):
         url = c["sourceUrl"]
         if len(url) > 60:
             url = url[:60] + "…"
-        lines.append(f"▸ {c['score']:.1f} [{c['track']}] {c['title'][:60]} — {url}")
+        lines.append(f"▸ {c['score']:.1f} [{c['track']}] {_clip(c['title'], 60)}")
+        if c.get("summary"):
+            lines.append(f"   📝 {_clip(c['summary'], 70)}")
+        if c.get("whyItMatters"):
+            lines.append(f"   💬 {_clip(c['whyItMatters'], 90)}")
+        lines.append(f"   🔗 {url}")
     subprocess.run([NOTIFY, "\n".join(lines)])
     print("✅ pushed")
 

@@ -38,6 +38,15 @@ import urllib.error
 import urllib.request
 import uuid
 
+# Sibling lightweight Markdown -> HTML renderer (pure stdlib). Falls back to a <pre>
+# block if the module is missing, so a partial install still produces a valid page.
+# The fallback escapes, so model output cannot inject markup in either path.
+try:
+    from markdown_render import md_to_html
+except ImportError:
+    def md_to_html(t):
+        return "<pre>%s</pre>" % html.escape(t)
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG_DIR = os.path.join(BASE, "data", "discord")
 CONFIG = os.path.join(CFG_DIR, "config.json")
@@ -274,7 +283,7 @@ def _rule_query(content):
     hits = set()
     low = content.lower()
     for rule, words in RULE_WORDS.items():
-        if not any(w in low for w in words):
+        if not any(w.lower() in low for w in words):
             continue
         rest = content
         for w in words:
@@ -342,12 +351,27 @@ def schedule_reply(content=""):
     return "\n".join(lines)
 
 
+def claude_cli():
+    """Resolve the LLM CLI to shell out to, or None.
+
+    CLAUDE_CLI wins -- point it at any Anthropic-compatible CLI (an absolute path, or a
+    bare command name to look up on PATH). Otherwise probe PATH and then ~/.local/bin:
+    cron/systemd/launchd run with a minimal PATH where shutil.which() alone finds nothing,
+    which is the usual reason a command that works interactively fails from a timer.
+    """
+    env = os.environ.get("CLAUDE_CLI")
+    if env:
+        return env if os.path.exists(env) else shutil.which(env)
+    p = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    return p if os.path.exists(p) else None
+
+
 def auto_answer(content):
     """Auto-answer mode (knowledge only, no tools): headless claude -p answers directly,
     returns (ok, text). No --allowedTools — the unapproved shell surface is rejected by the
     safety classifier, so hands-on tasks go through a session / the pool."""
-    claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
-    if not claude or not os.path.exists(claude):
+    claude = claude_cli()
+    if not claude:
         return False, "❌ claude CLI not found"
     cfg = load(CONFIG, {})
     prompt = (
@@ -385,8 +409,8 @@ def auto_task(content):
     returns (ok, need_session, answer). Tasks that don't touch the machine are completed
     directly; tasks that need local changes (files/calendar/programs) return need_session=true
     via the JSON contract → pool for a session. No Bash/Write/Edit — safety by construction."""
-    claude = os.environ.get("CLAUDE_CLI") or shutil.which("claude")
-    if not claude or not os.path.exists(claude):
+    claude = claude_cli()
+    if not claude:
         return False, False, "❌ claude CLI not found"
     prompt = (
         "You are the user's Discord auto-task assistant (read-only mode). The user just "
@@ -435,29 +459,81 @@ def auto_task(content):
 
 
 def post_task_result(cid, content, ans):
-    """Research done: reply with a summary + save the full report to reports/discord/ (HTML) and upload it"""
+    """Research done: reply with a summary + save the full report to reports/discord/ and upload it.
+
+    Fail-safe chain. `ans` is the product of a headless LLM run that may have spent ten
+    minutes on the network; no step in the render/save/upload path is allowed to discard
+    it, and none is allowed to escape into poll() and kill the polling loop. Order:
+    unconditionally write the raw .md first -> then try the HTML render, degrading to the
+    .md as the attachment -> then reply and upload, each in its own independent try.
+
+    Why this is structured this way: a CSS declaration `max-width:100%` inside a
+    `%`-formatted string raised `ValueError: unsupported format character '}'`, which
+    propagated out of poll() and silently lost two finished research reports. Hence the
+    `%%` below, and hence one try per stage instead of one try around everything.
+    """
     title = re.sub(r"\s+", " ", content)[:40]
     rdir = os.path.join(BASE, "reports", "discord")
-    os.makedirs(rdir, exist_ok=True)
     safe = re.sub(r"[^\w.\-#]", "_", title)
-    path = os.path.join(rdir, f"{time.strftime('%F')}-#{cid}-{safe}.html")
-    page = (
-        "<!DOCTYPE html>\n<html lang='en'><head><meta charset='utf-8'>"
-        "<title>Research #%d</title>\n<style>"
-        "body{font-family:-apple-system,'Segoe UI',sans-serif;"
-        "max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#24292f}"
-        "h1{font-size:20px;border-bottom:2px solid #0969da;padding-bottom:6px}"
-        ".req{background:#f0f7ff;border-left:4px solid #0969da;padding:8px 12px;margin:12px 0}"
-        "pre{white-space:pre-wrap;background:#f6f8fa;padding:12px;border-radius:6px;font-size:13px}"
-        "</style></head><body><h1>Research #%d</h1>"
-        "<div class='req'>Request: %s</div><pre>%s</pre>"
-        "</body></html>\n"
-    ) % (cid, cid, html.escape(content), html.escape(ans))
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(page)
+    stem = os.path.join(rdir, f"{time.strftime('%F')}-#{cid}-{safe}")
+    raw = stem + ".md"
+    try:  # stage 1: raw dump first -- everything below can fail without losing the result
+        os.makedirs(rdir, exist_ok=True)
+        with open(raw, "w", encoding="utf-8") as f:
+            f.write(f"# Research #{cid}\n\n> Request: {content}\n\n{ans}\n")
+    except Exception as e:
+        print(f"⚠️ raw dump failed: {e!r}")
+        raw = None
+    path = None
+    try:  # stage 2: HTML render; `path` stays None on failure -> the .md becomes the attachment
+        body = md_to_html(ans)  # markdown -> rendered HTML (escaping happens inside)
+        page = (
+            "<!DOCTYPE html>\n<html lang='en'><head><meta charset='utf-8'>"
+            "<title>Research #%d</title>\n<style>"
+            "body{font-family:-apple-system,'Segoe UI',sans-serif;"
+            "max-width:760px;margin:24px auto;padding:0 16px;line-height:1.7;color:#24292f}"
+            "h1{font-size:20px;border-bottom:2px solid #0969da;padding-bottom:6px}"
+            ".req{background:#f0f7ff;border-left:4px solid #0969da;padding:8px 12px;margin:12px 0;"
+            "border-radius:4px}"
+            "h2{font-size:17px;margin-top:24px;padding-bottom:4px;border-bottom:1px solid #d8dee4}"
+            "h3{font-size:15px}h4{font-size:14px}"
+            "table{border-collapse:collapse;margin:12px 0;display:block;overflow-x:auto;max-width:100%%}"
+            "th,td{border:1px solid #d8dee4;padding:6px 10px;font-size:13.5px}"
+            "th{background:#f6f8fa;font-weight:600}"
+            "pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow-x:auto;font-size:13px}"
+            "code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:13px}"
+            "pre code{background:none;padding:0}"
+            "blockquote{margin:12px 0;padding:2px 14px;color:#57606a;border-left:4px solid #d8dee4}"
+            "ul,ol{padding-left:24px;margin:8px 0}"
+            "li{margin:4px 0}hr{border:none;border-top:1px solid #d8dee4;margin:16px 0}"
+            "a{color:#0969da;text-decoration:none}a:hover{text-decoration:underline}"
+            "p{margin:8px 0}"
+            "</style></head><body><h1>Research #%d</h1>"
+            "<div class='req'>Request: %s</div>\n<div class='content'>%s</div>\n"
+            "</body></html>\n"
+        ) % (cid, cid, html.escape(content), body)
+        with open(stem + ".html", "w", encoding="utf-8") as f:
+            f.write(page)
+        path = stem + ".html"
+    except Exception as e:
+        print(f"⚠️ HTML render failed, falling back to the Markdown source: {e!r}")
     head = ans if len(ans) <= 1500 else ans[:290] + f"\n…(full {len(ans)} chars in the attachment)"
-    post(f"📄 Research done #{cid}: {head}")
-    send_file(path, f"📄 Research report #{cid}: {content[:60]}")
+    try:  # stage 3: summary reply
+        post(f"📄 Research done #{cid}: {head}")
+    except Exception as e:
+        print(f"⚠️ summary reply failed: {e!r}")
+    attach = path or raw
+    if attach and os.path.isfile(attach):
+        # The os.path.isfile guard is load-bearing: send_file() reports a missing file
+        # with sys.exit(), and SystemExit derives from BaseException -- `except Exception`
+        # below would NOT catch it, so without this check a missing file would kill the
+        # whole poll run from inside this function.
+        try:  # stage 4: upload
+            send_file(attach, f"📄 Research report #{cid}: {content[:60]}")
+        except Exception as e:
+            print(f"⚠️ attachment upload failed (source still at {attach}): {e!r}")
+    else:
+        print(f"⚠️ nothing to upload; research #{cid} survives only as the pool summary")
 
 
 def send_file(path, caption):
@@ -742,7 +818,10 @@ def cleanup(keep=10):
         items = tasks["items"]
         finished = sorted([it for it in items if it.get("status") in ("done", "auto")],
                           key=lambda it: it.get("id", 0))
-        old = finished[:-keep] if len(finished) > keep else []
+        # `if keep` rather than `if len(finished) > keep`: with keep=0 the latter passes,
+        # then finished[:-0] is finished[:0] -- an empty slice -- so the command would
+        # report "nothing to clean" and silently archive nothing. 0 means keep none.
+        old = finished[:-keep] if keep else finished[:]
         if not old:
             print(f"✅ nothing to clean (terminal state {len(finished)} ≤ keep {keep})")
             return

@@ -12,10 +12,10 @@ Move: +X-GM-LABELS "FORWARDED" then -X-GM-LABELS ("\\Inbox") — label + out of 
 Inbox; mail stays in All Mail, searchable and recoverable; local .eml kept.
 
 Usage:
-    python3 mail_ntu_move.py --sweep-dry  # count only, no move
-    python3 mail_ntu_move.py --sweep      # one-shot: scan the inbox, move all matches
-    python3 mail_ntu_move.py --scan       # incremental: new .eml files matched the same way (called from the mail_watch loop)
-    python3 mail_ntu_move.py --list       # show current count of the folder
+    python3 mail_forward_move.py --sweep-dry  # count only, no move
+    python3 mail_forward_move.py --sweep      # one-shot: scan the inbox, move all matches
+    python3 mail_forward_move.py --scan       # incremental: new .eml files matched the same way (called from the mail_watch loop)
+    python3 mail_forward_move.py --list       # show current count of the folder
 """
 import imaplib, json, os, re, subprocess, sys, time
 from email import policy

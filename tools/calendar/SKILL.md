@@ -1,18 +1,31 @@
 ---
 name: calendar
-description: Operate a macOS Calendar via AppleScript (add / today's events / delete). Invoke when the user says "add event X at time" or "what's on today". Events sync to iCloud (iPhone).
+description: Operate a macOS Calendar via AppleScript (add / query / delete events, add an advance alarm). Invoke when the user says "add event X at time", "what's on today", or "remind me N minutes before". Events sync to iCloud (iPhone).
+argument-hint: '<event description + time>, e.g. "add: group meeting 2026-09-22 16:00"'
+allowed-tools:
+  - Bash
+  - Read
 ---
 
 # calendar — macOS Calendar operations (AppleScript)
 
 > Calendar name defaults to `Agent` (the author's own) — **change it to yours**: edit `add_event.scpt` and the templates below (`calendar "Agent"`).
 
-## Reliable patterns (learned the hard way — do not change)
+## When to use
 
-1. **Run `open -a Calendar && sleep 4` first**, then run osascript (fails if Calendar isn't running).
-2. **Add events** by constructing with `current date` (set year/month/day/hours/minutes/seconds), template in `add_event.scpt`; events default to 1 hour.
-3. **Query events**: `whose summary contains "keyword"` (**do not use `is` with exact-match Chinese — fails with -1728**); the lower date bound must have hours/minutes/seconds reset to 0 (`current date` keeps the current time and silently misses earlier events of the day).
-4. **Delete events**: list the uid first, then `delete (first event of calendar "Agent" whose uid is "..." )` — deleting from a `whose`-filtered list inside a loop invalidates the iterator (-1728 "can't get item 2").
+| The user says | Action |
+|---|---|
+| "add event …", "schedule …", "on <date> at <time> …" | add an event |
+| "remind me N minutes before", "add an alarm" | add `display alarm` to the existing event |
+| "what's on today / tomorrow" | query events |
+| "move it to <time>", "cancel that event" | edit / delete |
+
+## Usage
+
+```bash
+open -a Calendar && sleep 4          # Calendar must be running or osascript errors out
+osascript add_event.scpt             # template: edit date/time/title, then run
+```
 
 ## Template
 
@@ -51,8 +64,33 @@ tell application "Calendar"
 end tell
 ```
 
-Note: `«class isot»` to text fails — use `time string` (locale-safe).
+## Decision rules
 
-## Files in this directory
+| Operation | Key points |
+|---|---|
+| Add event | assign `current date` **field by field** (year/month/day/hours/minutes/seconds); `end date` defaults to +1 hour |
+| Add an advance alarm | `make new display alarm at endDate with properties {trigger interval:-10}` |
+| Query | `whose summary contains "keyword"`; zero the lower date bound by hand |
+| Delete | list the uids first, then `delete (first event of calendar "Agent" whose uid is "...")` |
+
+## Gotchas
+
+- **`date "ISO string"` silently drops the time.** AppleScript parses `date` literals in the system locale; when parsing fails it keeps midnight, so the event lands at 00:00 with no error. Always assign fields individually.
+- **`trigger interval` on a `display alarm` is in MINUTES**, not seconds. Negative means "before the event" (`-10` = 10 minutes early); `0` is at start time.
+- **`whose summary is "<non-ASCII text>"` fails with -1728** under a CJK locale — exact matching on non-ASCII summaries is unreliable. Use `contains` instead.
+- **The query's lower date bound must have hours/minutes/seconds zeroed.** `current date` carries the current time, so using it directly as the `≥` bound silently misses events earlier in the same day.
+- **Deleting from a `whose`-filtered list inside a loop invalidates the iterator** (-1728 "can't get item 2"). Collect the uids first, then delete one by one by uid.
+- **`«class isot»` cannot be coerced to text.** Format times with `time string`, which is locale-safe.
+- **If Calendar.app is not running, osascript fails outright** — always `open -a Calendar && sleep 4` first (a cold start can take longer than 4s).
+
+## Architecture
+
+This skill is **Mac-only and unscheduled**: the scheduler for the rest of the collection runs on a Linux host, which has no `osascript`, so calendar work stays on the workstation and is triggered from a session.
+
+The calendar is matched **by name**, and it must live under an iCloud account for events to reach other devices. AppleScript has no notion of accounts, so a new calendar can only be created in the GUI — a script that tries to create one, or that names an account, will not work.
+
+Other skills that need the schedule do not query the calendar live. A periodic job on the Mac exports a **snapshot** of today's and tomorrow's events, which is then shipped to the scheduler host; a missing or stale snapshot means the Mac side has not run (asleep, off, or the job unloaded), not that the reader is broken.
+
+## Files here
 
 - `add_event.scpt` — add-event template (edit date/time/title, then `osascript add_event.scpt`)

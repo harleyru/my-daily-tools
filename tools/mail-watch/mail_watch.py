@@ -114,7 +114,7 @@ def main():
                    capture_output=True)
 
     # 6) Forwarded-mail routing: mail forwarded from an institutional mailbox → folder
-    subprocess.run([sys.executable, os.path.join(MAIL_DIR, "mail_ntu_move.py"), "--scan"],
+    subprocess.run([sys.executable, os.path.join(MAIL_DIR, "mail_forward_move.py"), "--scan"],
                    capture_output=True)
 
 

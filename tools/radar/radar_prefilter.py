@@ -19,6 +19,12 @@ RAW = os.path.join(RADAR, "raw")
 CONFIG = json.load(open(os.path.join(RADAR, "config.json"), encoding="utf-8"))
 SEEN_DB = os.path.join(RADAR, "seen.sqlite")
 
+# Drop items published longer ago than this — history that fell outside the fetch window.
+SITE_DAYS = int(CONFIG.get("siteDays", 7))
+# Junk/placeholder titles (e.g. "not much happened today"), matched case-insensitively as
+# substrings against the title only. Empty unless titleBlocklist is set in config.
+BLOCKLIST = [b.lower() for b in CONFIG.get("titleBlocklist", [])]
+
 
 def init_db():
     con = sqlite3.connect(SEEN_DB)
@@ -37,6 +43,25 @@ def match_tracks(title, text):
     return hits
 
 
+def _parse_time(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def old_entry(it, now):
+    """True if published more than siteDays ago -> drop during prefilter.
+
+    Deliberately conservative: a missing or unparseable publishedAt returns False (keep
+    the item), so a datetime parsing failure can never silently drop a candidate.
+    """
+    t = _parse_time(it.get("publishedAt"))
+    if t is None:
+        return False
+    return (now - t).total_seconds() > SITE_DAYS * 86400
+
+
 def main():
     date = sys.argv[1] if len(sys.argv) > 1 else datetime.now().strftime("%Y-%m-%d")
     items_path = os.path.join(RAW, date, "items.json")
@@ -47,17 +72,36 @@ def main():
     fetched = len(data["items"])
 
     con = init_db()
-    now = datetime.now(timezone.utc).isoformat()
+    now_dt = datetime.now(timezone.utc)   # for date arithmetic
+    now = now_dt.isoformat()              # for what we write to the db
     kept = []
     seen = set()
+    renewed = set()
+    dropped_old = 0
+    dropped_bl = 0
     for it in data["items"]:
-        hits = match_tracks(it.get("title", ""), it.get("text", ""))
+        title = it.get("title", "")
+        # Junk title blocklist (placeholders/noise, e.g. "not much happened today")
+        if BLOCKLIST and any(b in title.lower() for b in BLOCKLIST):
+            dropped_bl += 1
+            continue
+        hits = match_tracks(title, it.get("text", ""))
         if not hits:
             continue
-        uid = it["id"]
-        cur = con.execute("SELECT 1 FROM seen WHERE uid=?", (uid,))
-        if cur.fetchone():
+        # Age filter: anything older than siteDays is history outside the fetch window.
+        if old_entry(it, now_dt):
+            dropped_old += 1
             continue
+        uid = it["id"]
+        row = con.execute("SELECT first_seen FROM seen WHERE uid=?", (uid,)).fetchone()
+        if row:
+            first = _parse_time(row[0])
+            # seen would otherwise pin entries that reached the candidate list but the
+            # editorial stage never picked -> let them through again once out of window,
+            # restarting their clock.
+            if first is None or (now_dt - first).total_seconds() < SITE_DAYS * 86400:
+                continue
+            renewed.add(uid)
         seen.add(uid)
         out = dict(it)
         out["trackHints"] = {t: len(k) for t, k in hits.items()}
@@ -68,10 +112,14 @@ def main():
     kept.sort(key=lambda x: -x["rank"])
     if seen:
         con.executemany("INSERT OR IGNORE INTO seen VALUES (?,?)", [(u, now) for u in seen])
+    if renewed:
+        con.executemany("UPDATE seen SET first_seen=? WHERE uid=?",
+                        [(now, u) for u in renewed])
     con.commit()
     con.close()
 
-    print(f"fetched {fetched} → {len(kept)} keyword hits (after dedupe)")
+    print(f"fetched {fetched} → {len(kept)} keyword hits (after dedupe; "
+          f"{dropped_old} stale / {dropped_bl} blocklisted / {len(renewed)} re-scored past window)")
     out = {"date": date, "fetched": fetched, "prefiltered": len(kept),
            "generatedAt": now, "items": kept}
     with open(os.path.join(RAW, date, "prefiltered.json"), "w", encoding="utf-8") as f:

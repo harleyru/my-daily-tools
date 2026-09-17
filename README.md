@@ -10,11 +10,11 @@ These are the tools I run for my own daily workflow. They are published as-is be
 |---|---|---|
 | `notify` | Push a message to a Lark (Feishu) webhook with a required keyword, mirror to Discord. | curl, macOS Keychain or `.env`, optional Discord bot |
 | `radar` | Personal research radar: arXiv API + RSS + Hacker News Algolia → keyword prefilter + dedup (sqlite) → headless LLM editorial scoring → HTML report + notify push. Pure stdlib. | python3, optional `claude` CLI |
-| `mail-watch` | Incremental Gmail sync to local .eml backup + push important senders to notify. | python3 + imaplib, Gmail app password |
+| `mail-watch` | Incremental Gmail sync to local .eml backup + push important senders to notify; chains ad-archive and forwarded-mail routing. | python3 + imaplib, Gmail app password |
 | `mail-ad-review` | Archive/queue promotional Gmail automatically (remove `\Inbox` label; recoverable in All Mail), sender whitelist auto-archive. | python3, Gmail app password |
-| `discord-bridge` | Poll a Discord channel for @-mentions → task pool (JSON) → reply receipt; query/QA/auto-execution tiers. | python3, Discord bot token, `claude` CLI |
+| `discord-bridge` | Poll a Discord channel for @-mentions → task pool (JSON) → reply receipt; query/QA/auto-execution tiers; queues "add event" requests for the Mac; renders replies as HTML. | python3, Discord bot token, `claude` CLI |
 | `calendar` | Add/query/delete events on a macOS calendar via AppleScript (iCloud-synced). | macOS Calendar |
-| `weekly-report` | Aggregate a week of daily markdown notes + task tracker → push weekly report via notify. | python3 |
+| `weekly-report` | Aggregate a week of daily markdown notes + task tracker → push weekly report via notify; also a daily morning digest. | python3 |
 
 ## Install
 
@@ -53,17 +53,25 @@ tools/<skill>/<scripts>  — standalone scripts (also runnable without Claude Co
 config-examples/         — config templates (copy to data/, which is gitignored)
 ```
 
+Every `SKILL.md` follows the same sections: **When to use** → **Usage** → **Decision rules** → **Gotchas** → **Architecture** → **Files here**. The Gotchas sections are the useful part — each one is a failure that actually happened, and most of them are portable lessons rather than notes about this particular setup.
+
 ## Notes & caveats
 
 - `calendar` uses the calendar named "Agent" — edit `add_event.scpt` to your own calendar name.
 - `mail-watch`'s `IMPORTANT_SENDERS` and `mail-ad-review`'s `AUTO_ARCHIVE_SENDERS` are personal rules — replace with your own.
-- `mail_ntu_move.py` is a reference implementation for routing forwarded mail from an institutional mailbox into a folder; adjust the domain/label to your own setup.
-- `radar`'s editorial stage and `discord-bridge`'s answer tiers shell out to an LLM CLI headlessly — point `RADAR_EDITOR` (radar) or `CLAUDE_CLI` (discord-bridge) at any Anthropic-compatible CLI; both fall back to `claude`.
+- `mail_forward_move.py` is a reference implementation for routing forwarded mail from an institutional mailbox into a folder; adjust the domain/label to your own setup.
+- `radar`'s editorial stage and `discord-bridge`'s answer tiers shell out to an LLM CLI headlessly — point `RADAR_EDITOR` (radar) or `CLAUDE_CLI` (discord-bridge) at any Anthropic-compatible CLI; both fall back to `claude`. A wrapper that routes to another provider works fine, as long as it clears `ANTHROPIC_*` / `CLAUDE_*` in the environment it passes down — inheriting a proxied session's env is a common cause of 401s.
 - The `discord-bridge` auto-execution tier only grants read-only web tools to the LLM agent; mutating host actions are queued to the human session by contract (`need_session`).
 
-## Related
+## Running across two machines
 
-- [lab-instrument-drivers](https://github.com/harleyru/lab-instrument-drivers) — typed, auditable Python drivers and agent skills for safe laboratory-instrument discovery and automation via PyVISA (the hardware-facing counterpart to these skills).
+This collection is built for a split setup: an **always-on Linux host** runs the schedules (radar, mail sync, weekly report, the Discord poll), while a **Mac** owns the two things only a Mac can do — the calendar and the local mail tree. Three rules make that split work, and they are the reason several of these scripts look more defensive than they need to:
+
+- **Anything Mac-only is triggered by request, not assumed.** A calendar change arrives as a queued request that the Mac picks up on its own sync and answers by pushing a result back — the host never calls the Mac directly.
+- **Data crosses in one direction and by explicit file list.** The Mac pushes a small, named set of files to the host; the host owns its own live `data/` and never syncs it back. A directory-level sync in both directions is how two machines silently overwrite each other.
+- **Reads use snapshots, and a missing snapshot is reported, never faked.** A query that needs Mac-side data reads the last synced snapshot and says "not synced" when it is stale, rather than answering from nothing.
+
+Credentials follow the same split: `.env` on the host, keychain on the Mac, same scripts.
 
 ## License
 

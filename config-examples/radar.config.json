@@ -19,9 +19,12 @@
     "T1": ["ai agent", "science agent", "laboratory agent", "lab automation", "benchmark", "harness", "reinforcement learning", "large language model", "llm"],
     "T2": ["nitrogen vacancy", "nv center", "color center", "diamond", "odmr", "magnetomet", "quantum sensing", "hbn", "wide-field", "spin qubit", "single photon", "cryogenic"],
     "T3": ["instrument control", "experiment automation", "quantum control", "fpga", "red pitaya", "rfsoc", "time tagger", "lock-in", "awg", "microwave"],
-    "T4": ["ai for science", "ai4science", "scientific discovery", "materials discovery", "quantum computing"]
+    "T4": ["ai for science", "ai4science", "scientific discovery", "materials discovery", "quantum computing"],
+    "T5": []
   },
   "maxEditorialItems": 40,
   "textTruncate": 1200,
-  "siteDays": 7
+  "siteDays": 7,
+  "_comment_titleBlocklist": "Optional. Lowercase substrings matched against the title only; a candidate whose title contains any of them is dropped in the prefilter (junk/placeholder posts). Empty list disables the filter.",
+  "titleBlocklist": []
 }
